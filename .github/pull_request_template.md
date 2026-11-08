@@ -27,6 +27,6 @@ None
 ## Checklist
 
 - [ ] Tests cover the changed behavior, or this PR changes no behavior
-- [ ] No personal data, secrets, real domains or account IDs in committed files
+- [ ] No personal data, secrets, personal domains or account IDs in committed files (public and standard domains are fine)
 - [ ] Both language versions of changed docs are updated
 - [ ] Code, comments and docs are in English (exceptions: explicit Swedish copies of English docs, and user-facing Swedish app content)
