@@ -14,15 +14,15 @@ public sealed class TestSshd : IDisposable
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(5);
 
     private readonly Process _process;
-    private readonly string _dir;
+    private readonly DirectoryInfo _directory;
 
     public int Port { get; }
     public string ClientKeyPath { get; }
 
-    private TestSshd(Process process, string dir, int port, string clientKeyPath)
+    private TestSshd(Process process, DirectoryInfo directory, int port, string clientKeyPath)
     {
         _process = process;
-        _dir = dir;
+        _directory = directory;
         Port = port;
         ClientKeyPath = clientKeyPath;
     }
@@ -53,16 +53,12 @@ public sealed class TestSshd : IDisposable
             return null;
         }
 
-        var dir = Path.Combine(Path.GetTempPath(), $"skerry-sshd-{Guid.NewGuid():N}");
+        var directory = Directory.CreateTempSubdirectory("skerry-sshd-");
+        var dir = directory.FullName;
         Process? server = null;
 
         try
         {
-            // Keep private keys and all fixture files inaccessible to other
-            // users on shared CI hosts.
-            Directory.CreateDirectory(dir,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-
             var hostKey = Path.Combine(dir, "hostkey");
             if (!RunKeygen(hostKey))
             {
@@ -121,9 +117,9 @@ public sealed class TestSshd : IDisposable
                     using var probeClient = new TcpClient();
                     probeClient.Connect("127.0.0.1", port);
 
-                    var fixture = new TestSshd(server, dir, port, clientKey);
-                    server = null; // Ownership transfers to the fixture.
-                    dir = null!;   // The fixture now owns the directory.
+                    var fixture = new TestSshd(server, directory, port, clientKey);
+                    server = null;    // Ownership transfers to the fixture.
+                    directory = null!; // The fixture now owns the directory.
                     return fixture;
                 }
                 catch (SocketException)
@@ -147,9 +143,9 @@ public sealed class TestSshd : IDisposable
                 server.Dispose();
             }
 
-            if (dir is not null)
+            if (directory is not null)
             {
-                TryDeleteDirectory(dir);
+                TryDeleteDirectory(directory);
             }
         }
     }
@@ -203,13 +199,13 @@ public sealed class TestSshd : IDisposable
         }
     }
 
-    private static void TryDeleteDirectory(string path)
+    private static void TryDeleteDirectory(DirectoryInfo directory)
     {
         try
         {
-            if (Directory.Exists(path))
+            if (directory.Exists)
             {
-                Directory.Delete(path, recursive: true);
+                directory.Delete(recursive: true);
             }
         }
         catch (IOException)
@@ -226,6 +222,6 @@ public sealed class TestSshd : IDisposable
     {
         StopProcess(_process);
         _process.Dispose();
-        TryDeleteDirectory(_dir);
+        TryDeleteDirectory(_directory);
     }
 }
