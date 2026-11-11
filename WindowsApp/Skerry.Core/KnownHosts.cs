@@ -26,14 +26,23 @@ public sealed class KnownHosts
     }
 
     private const int MaxKnownHostsBytes = 4 * 1024 * 1024;
+    private static FileAttributes? ExistingAttributes(string path)
+    {
+        try { return File.GetAttributes(path); }
+        catch (FileNotFoundException) { return null; }
+        catch (DirectoryNotFoundException) { return null; }
+    }
+
     private static Dictionary<string, string> Load(string? path)
     {
         var result = new Dictionary<string, string>();
         if (path is null) return result;
-        if (Directory.Exists(path)) throw new IOException("known_hosts-sökvägen är en katalog");
-        if (!File.Exists(path)) return result;
-        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        var attributes = ExistingAttributes(path);
+        if (attributes is null) return result;
+        if ((attributes.Value & FileAttributes.ReparsePoint) != 0)
             throw new IOException("known_hosts får inte vara en symlänk eller reparse point");
+        if ((attributes.Value & FileAttributes.Directory) != 0)
+            throw new IOException("known_hosts-sökvägen är en katalog");
 
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         if (stream.Length > MaxKnownHostsBytes)
@@ -88,17 +97,19 @@ public sealed class KnownHosts
         if (!string.IsNullOrEmpty(dir))
         {
             Directory.CreateDirectory(dir);
-            if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0)
-                throw new IOException("known_hosts-katalogen får inte vara en reparse point");
+            var directoryAttributes = ExistingAttributes(dir);
+            if (directoryAttributes is null ||
+                (directoryAttributes.Value & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != FileAttributes.Directory)
+                throw new IOException("known_hosts-katalogen måste vara en riktig katalog");
         }
-        if (File.Exists(_path))
-        {
-            if ((File.GetAttributes(_path) & FileAttributes.ReparsePoint) != 0 ||
-                (File.GetAttributes(_path) & FileAttributes.Directory) != 0)
-                throw new IOException("known_hosts måste vara en vanlig fil, inte en reparse point");
-        }
+        var fileAttributes = ExistingAttributes(_path);
+        if (fileAttributes is not null &&
+            (fileAttributes.Value & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
+            throw new IOException("known_hosts måste vara en vanlig fil, inte en reparse point");
         using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough);
         var bytes = new System.Text.UTF8Encoding(false).GetBytes($"{id} {keyString}\n");
+        if (stream.Length + bytes.Length > MaxKnownHostsBytes)
+            throw new IOException("known_hosts överskrider storleksgränsen på 4 MiB");
         stream.Write(bytes, 0, bytes.Length);
         stream.Flush(flushToDisk: true);
     }
