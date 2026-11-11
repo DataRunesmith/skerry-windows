@@ -41,6 +41,28 @@ public static class FsUtil
         }
     }
 
+    public static byte[] ReadAllBytesCapped(string path, int maxBytes)
+    {
+        if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        var attributes = File.GetAttributes(path);
+        if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
+            throw new IOException("lagringsfilen måste vara en vanlig fil, inte en reparse point");
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (stream.Length > maxBytes)
+            throw new IOException($"filen överskrider storleksgränsen på {maxBytes} byte");
+        using var memory = new MemoryStream();
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var count = stream.Read(buffer, 0, buffer.Length);
+            if (count == 0) break;
+            if (memory.Length + count > maxBytes)
+                throw new IOException($"filen överskred storleksgränsen på {maxBytes} byte under läsning");
+            memory.Write(buffer, 0, count);
+        }
+        return memory.ToArray();
+    }
+
     public static void AtomicWriteText(string path, string text) =>
         AtomicWrite(path, System.Text.Encoding.UTF8.GetBytes(text));
 }
