@@ -36,6 +36,8 @@ public static class SyncCrypto
 
     public static byte[] Seal(SyncState state, string passphrase, int iterations = DefaultIterations)
     {
+        if (iterations < MinIterations || iterations > MaxIterations)
+            throw new SyncCryptoException(SyncCryptoError.BadFormat);
         var salt = RandomNumberGenerator.GetBytes(SaltLen);
         var nonce = RandomNumberGenerator.GetBytes(NonceLen);
         var key = DeriveKey(passphrase, salt, iterations);
@@ -64,7 +66,9 @@ public static class SyncCrypto
     public static SyncState Open(byte[] data, string passphrase)
     {
         var headerLen = Magic.Length + 4 + SaltLen + NonceLen;
-        if (data.Length <= headerLen + TagLen || !data.AsSpan(0, Magic.Length).SequenceEqual(Magic))
+        if (data.Length > 64 * 1024 * 1024 ||
+            data.Length <= headerLen + TagLen ||
+            !data.AsSpan(0, Magic.Length).SequenceEqual(Magic))
             throw new SyncCryptoException(SyncCryptoError.BadFormat);
 
         var iterationsBytes = data.AsSpan(Magic.Length, 4).ToArray();
@@ -118,8 +122,20 @@ public sealed class EncryptedFolderSyncProvider(string path, string passphrase) 
 {
     public SyncState? Pull()
     {
-        if (!File.Exists(path)) return null;
-        return SyncCrypto.Open(File.ReadAllBytes(path), passphrase);
+        byte[] data;
+        try
+        {
+            data = FsUtil.ReadAllBytesCapped(path, 64 * 1024 * 1024);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
+        }
+        return SyncCrypto.Open(data, passphrase);
     }
 
     public void Push(SyncState state)
