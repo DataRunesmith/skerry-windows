@@ -53,7 +53,7 @@ public sealed class TestSshd : IDisposable
             return null;
         }
 
-        var directory = Directory.CreateTempSubdirectory("skerry-sshd-");
+        DirectoryInfo? directory = Directory.CreateTempSubdirectory("skerry-sshd-");
         var dir = directory.FullName;
         Process? server = null;
 
