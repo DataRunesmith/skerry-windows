@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: windows-2025
+    runs-on: windows-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v5
