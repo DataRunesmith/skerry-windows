@@ -19,6 +19,7 @@ public static class SyncCrypto
     private const int SaltLen = 16;
     private const int NonceLen = 12;
     private const int TagLen = 16;
+    private const int MaxEnvelopeBytes = 64 * 1024 * 1024;
     /// <summary>
     /// Gräns för <c>iterations</c>-fältet LÄST UR EN FIL — kuvertet kommer
     /// per design från en obetrodd tredjepartsmapp, så en manipulerad fil
@@ -43,6 +44,9 @@ public static class SyncCrypto
         var key = DeriveKey(passphrase, salt, iterations);
 
         var plaintext = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
+        var maxPlaintext = MaxEnvelopeBytes - Magic.Length - 4 - SaltLen - NonceLen - TagLen;
+        if (plaintext.Length > maxPlaintext)
+            throw new SyncCryptoException(SyncCryptoError.BadFormat);
         var ciphertext = new byte[plaintext.Length];
         var tag = new byte[TagLen];
         using (var aes = new AesGcm(key, TagLen))
@@ -66,7 +70,7 @@ public static class SyncCrypto
     public static SyncState Open(byte[] data, string passphrase)
     {
         var headerLen = Magic.Length + 4 + SaltLen + NonceLen;
-        if (data.Length > 64 * 1024 * 1024 ||
+        if (data.Length > MaxEnvelopeBytes ||
             data.Length <= headerLen + TagLen ||
             !data.AsSpan(0, Magic.Length).SequenceEqual(Magic))
             throw new SyncCryptoException(SyncCryptoError.BadFormat);
