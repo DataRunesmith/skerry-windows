@@ -33,16 +33,27 @@ public sealed class HostStore
     /// </summary>
     private static SyncState Load(string path)
     {
-        if (!File.Exists(path)) return new SyncState();
-        var text = File.ReadAllText(path);
+        byte[] data;
         try
         {
-            return JsonSerializer.Deserialize<SyncState>(text, JsonOptions) ?? new SyncState();
+            data = FsUtil.ReadAllBytesCapped(path, 64 * 1024 * 1024);
+        }
+        catch (FileNotFoundException)
+        {
+            return new SyncState();
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return new SyncState();
+        }
+        try
+        {
+            return JsonSerializer.Deserialize<SyncState>(data, JsonOptions) ?? new SyncState();
         }
         catch (JsonException)
         {
             // Äldre format: en ren Host[]-array utan SyncState-omslag.
-            return new SyncState { Hosts = JsonSerializer.Deserialize<List<Host>>(text, JsonOptions) ?? new() };
+            return new SyncState { Hosts = JsonSerializer.Deserialize<List<Host>>(data, JsonOptions) ?? new() };
         }
     }
 
