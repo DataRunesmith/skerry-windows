@@ -27,16 +27,37 @@ public sealed class TestSshd : IDisposable
         ClientKeyPath = clientKeyPath;
     }
 
-    /// <summary>Returnerar null (inte ett kastat undantag) om miljön saknar sshd/ssh-keygen — anroparen hoppar då över testet, samma "hoppa över, inte fail" som Rust-sidans motsvarighet.</summary>
+    /// <summary>Returns null when the SSH fixture is unavailable locally; fixture failures fail CI.</summary>
     public static TestSshd? Start()
+    {
+        var fixture = StartOptional();
+        if (fixture is null && string.Equals(
+                Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Failed to start the test SSH server in CI.");
+        }
+
+        return fixture;
+    }
+
+    private static TestSshd? StartOptional()
     {
         var dir = Path.Combine(Path.GetTempPath(), $"skerry-cs-sshd-{Guid.NewGuid()}");
         Directory.CreateDirectory(dir);
 
         var hostKey = Path.Combine(dir, "hostkey");
-        if (!RunKeygen(hostKey)) return null;
+        if (!RunKeygen(hostKey))
+        {
+            Directory.Delete(dir, recursive: true);
+            return null;
+        }
+
         var clientKey = Path.Combine(dir, "client_key");
-        if (!RunKeygen(clientKey)) return null;
+        if (!RunKeygen(clientKey))
+        {
+            Directory.Delete(dir, recursive: true);
+            return null;
+        }
 
         var authorizedKeys = Path.Combine(dir, "authorized_keys");
         File.Copy(clientKey + ".pub", authorizedKeys);
