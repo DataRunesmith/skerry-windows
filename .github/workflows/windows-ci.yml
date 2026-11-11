@@ -1,0 +1,38 @@
+name: Windows CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-2025
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up .NET 10 LTS
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore application
+        run: dotnet restore WindowsApp/WindowsApp.csproj
+
+      - name: Restore tests
+        run: dotnet restore WindowsApp/Skerry.Core.Tests/Skerry.Core.Tests.csproj
+
+      - name: Build Windows application
+        run: dotnet build WindowsApp/WindowsApp.csproj --configuration Release --no-restore -p:Platform=x64
+
+      - name: Run core tests
+        run: dotnet test WindowsApp/Skerry.Core.Tests/Skerry.Core.Tests.csproj --configuration Release --no-restore --logger "console;verbosity=normal"
