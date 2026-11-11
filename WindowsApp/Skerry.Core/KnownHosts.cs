@@ -58,7 +58,7 @@ public sealed class KnownHosts
             memory.Write(buffer, 0, count);
         }
         var text = new System.Text.UTF8Encoding(false, true).GetString(memory.ToArray());
-        foreach (var line in text.Split(new[] { '\\r', '\\n' }, StringSplitOptions.RemoveEmptyEntries))
+        foreach (var line in text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
         {
             var spaceIndex = line.IndexOf(' ');
             if (spaceIndex <= 0) continue;
