@@ -16,6 +16,8 @@ public sealed record SftpEntry(string Name, bool IsDirectory, long Size);
 
 public sealed class SftpBrowserSession : IDisposable
 {
+    private const int MaxReadWriteBytes = 64 * 1024 * 1024;
+    private const int MaxDirectoryEntries = 10_000;
     private readonly SftpClient _client;
 
     private SftpBrowserSession(SftpClient client) => _client = client;
@@ -27,33 +29,60 @@ public sealed class SftpBrowserSession : IDisposable
         var connectionInfo = new ConnectionInfo(host.HostName, (int)host.Port, host.User, auth);
         var client = new SftpClient(connectionInfo);
         client.HostKeyReceived += SshSession.MakeHostKeyHandler(host, knownHosts, throwOnChange: true);
-        client.Connect();
-        return new SftpBrowserSession(client);
+        try
+        {
+            client.Connect();
+            return new SftpBrowserSession(client);
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Katalogen listas alltid mapp-först, sedan alfabetiskt inom varje grupp (samma sortering som App/LinuxApp).</summary>
-    public IReadOnlyList<SftpEntry> List(string path) =>
-        _client.ListDirectory(path)
+    public IReadOnlyList<SftpEntry> List(string path)
+    {
+        var entries = _client.ListDirectory(path)
             .Where(f => f.Name != "." && f.Name != "..")
+            .Take(MaxDirectoryEntries + 1)
             .Select(f => new SftpEntry(f.Name, f.IsDirectory, f.Length))
+            .ToList();
+        if (entries.Count > MaxDirectoryEntries)
+            throw new IOException($"Katalogen innehåller fler än {MaxDirectoryEntries} poster.");
+        return entries
             .OrderByDescending(e => e.IsDirectory)
             .ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
 
     public byte[] ReadFile(string path)
     {
-        using var stream = new MemoryStream();
-        _client.DownloadFile(path, stream);
+        using var remote = _client.OpenRead(path);
+        if (remote.Length > MaxReadWriteBytes)
+            throw new IOException($"Filen överskrider läsgränsen på {MaxReadWriteBytes} byte.");
+        using var stream = new MemoryStream((int)remote.Length);
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var count = remote.Read(buffer, 0, buffer.Length);
+            if (count == 0) break;
+            if (stream.Length + count > MaxReadWriteBytes)
+                throw new IOException($"Filen överskred läsgränsen på {MaxReadWriteBytes} byte under läsning.");
+            stream.Write(buffer, 0, count);
+        }
         return stream.ToArray();
     }
 
-    /// <summary>Skapar filen om den inte finns (SFTP v3 saknar en egen "skapa om saknas"-flagga i SSH.NETs UploadFile, men den öppnar/skapar redan korrekt).</summary>
+    /// <summary>Skapar eller ersätter en fil, med en övre gräns för att undvika oavsiktliga minnes- och nätverksbelastningar.</summary>
     public void WriteFile(string path, byte[] data)
     {
-        using var stream = new MemoryStream(data);
+        if (data.Length > MaxReadWriteBytes)
+            throw new IOException($"Filen överskrider skrivgränsen på {MaxReadWriteBytes} byte.");
+        using var stream = new MemoryStream(data, writable: false);
         _client.UploadFile(stream, path, canOverride: true);
     }
-
     /// <summary>Försöker avkoda som UTF-8 STRIKT (kastar på ogiltiga byte-sekvenser) — samma säkerhetsmarginal som Swiftsidans <c>String(bytes:encoding:.utf8)</c>: binärt innehåll ska aldrig tyst tolkas som text och riskera att sparas över.</summary>
     public static bool TryDecodeUtf8(byte[] bytes, out string text)
     {
