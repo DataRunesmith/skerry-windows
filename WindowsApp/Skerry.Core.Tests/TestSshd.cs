@@ -5,8 +5,8 @@ using System.Net.Sockets;
 namespace Skerry.Core.Tests;
 
 /// <summary>
-/// Fristående, minimal sshd-instans på en slumpad hög port med en egen
-/// konfigfil (läser inte systemets sshd_config). Används av SSH/SFTP-integrationstester.
+/// Standalone, minimal sshd instance on a random high port with its own
+/// configuration file (does not read the system sshd_config). Used by SSH/SFTP integration tests.
 /// </summary>
 public sealed class TestSshd : IDisposable
 {
@@ -83,9 +83,9 @@ public sealed class TestSshd : IDisposable
 
             var configPath = Path.Combine(dir, "sshd_config");
             File.WriteAllText(configPath,
-                $"Port {port}\nListenAddress 127.0.0.1\nHostKey {hostKey}\nAuthorizedKeysFile {authorizedKeys}\n" +
+                $"Port {port}\nListenAddress 127.0.0.1\nHostKey {QuoteConfigPath(hostKey)}\nAuthorizedKeysFile {QuoteConfigPath(authorizedKeys)}\n" +
                 "PubkeyAuthentication yes\nPasswordAuthentication no\nUsePAM no\nStrictModes no\n" +
-                $"Subsystem sftp internal-sftp\nPidFile {Path.Combine(dir, "pid")}\n");
+                $"Subsystem sftp internal-sftp\nPidFile {QuoteConfigPath(Path.Combine(dir, "pid"))}\n");
 
             var psi = new ProcessStartInfo("/usr/sbin/sshd")
             {
@@ -137,18 +137,32 @@ public sealed class TestSshd : IDisposable
         }
         finally
         {
-            if (server is not null)
+            try
             {
-                StopProcess(server);
-                server.Dispose();
+                if (server is not null)
+                {
+                    StopProcess(server);
+                }
             }
-
-            if (directory is not null)
+            finally
             {
-                TryDeleteDirectory(directory);
+                try
+                {
+                    server?.Dispose();
+                }
+                finally
+                {
+                    if (directory is not null)
+                    {
+                        TryDeleteDirectory(directory);
+                    }
+                }
             }
         }
     }
+
+    private static string QuoteConfigPath(string path) =>
+        "\"" + path.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
 
     private static bool RunKeygen(string path)
     {
@@ -185,7 +199,20 @@ public sealed class TestSshd : IDisposable
         {
             if (!process.HasExited)
             {
-                process.Kill(entireProcessTree: true);
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch (AggregateException)
+                {
+                    // Tree termination can fail partially while the daemon is still alive.
+                    // Retry the daemon itself and still wait for its actual exit below.
+                    if (!process.HasExited)
+                    {
+                        process.Kill();
+                    }
+                }
+
                 process.WaitForExit(2000);
             }
         }
@@ -220,8 +247,20 @@ public sealed class TestSshd : IDisposable
 
     public void Dispose()
     {
-        StopProcess(_process);
-        _process.Dispose();
-        TryDeleteDirectory(_directory);
+        try
+        {
+            StopProcess(_process);
+        }
+        finally
+        {
+            try
+            {
+                _process.Dispose();
+            }
+            finally
+            {
+                TryDeleteDirectory(_directory);
+            }
+        }
     }
 }
