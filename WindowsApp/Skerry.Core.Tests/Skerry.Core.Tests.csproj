@@ -20,7 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\\Skerry.Core\\Skerry.Core.csproj" />
+    <ProjectReference Include="..\Skerry.Core\Skerry.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>
