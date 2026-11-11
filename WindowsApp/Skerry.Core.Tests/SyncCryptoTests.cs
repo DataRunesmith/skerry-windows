@@ -36,6 +36,15 @@ public class SyncCryptoTests
         Assert.Equal("web", opened.Hosts[0].Alias);
     }
 
+    [Theory]
+    [InlineData(999)]
+    [InlineData(10_000_001)]
+    public void SealRejectsOutOfRangeIterationCounts(int iterations)
+    {
+        var ex = Assert.Throws<SyncCryptoException>(() => SyncCrypto.Seal(SampleState(), "pw", iterations));
+        Assert.Equal(SyncCryptoError.BadFormat, ex.Error);
+    }
+
     [Fact]
     public void WrongPassphraseFails()
     {
