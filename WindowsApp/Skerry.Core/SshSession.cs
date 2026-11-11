@@ -291,6 +291,11 @@ public sealed class SshSession : IDisposable
         {
             var keyString = $"{e.HostKeyName} {Convert.ToBase64String(e.HostKey)}";
             var result = knownHosts.Check(host.HostName, (int)host.Port, keyString);
+            if (result.Verdict == KnownHostVerdict.StorageFailure)
+            {
+                e.CanTrust = false;
+                throw new IOException("known_hosts kunde inte sparas säkert; SSH-anslutningen avvisades");
+            }
             e.CanTrust = result.Verdict != KnownHostVerdict.Changed;
             if (throwOnChange && result.Verdict == KnownHostVerdict.Changed)
             {
