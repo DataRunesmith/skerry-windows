@@ -17,7 +17,6 @@ public sealed class TestSshd : IDisposable
     private const int SigTerm = 15;
     private const int SigKill = 9;
     private const int NoSuchProcess = 3;
-    private const int PermissionDenied = 1;
 
     private static readonly TimeSpan KeygenTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(5);
@@ -589,6 +588,7 @@ public sealed class TestSshd : IDisposable
     /// <summary>Waits until the daemon, its process group, and every captured descendant have exited.</summary>
     /// <param name="process">The daemon process handle.</param>
     /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <param name="processGroupStartTime">The start time identifying the original process group.</param>
     /// <param name="descendants">The captured descendant identities.</param>
     /// <param name="timeout">The maximum wait duration.</param>
     /// <returns><see langword="true"/> when no live daemon process or captured descendant remains.</returns>
@@ -616,6 +616,7 @@ public sealed class TestSshd : IDisposable
     /// <summary>Checks all known process identities before allowing fixture files to be deleted.</summary>
     /// <param name="process">The daemon process handle.</param>
     /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <param name="processGroupStartTime">The start time identifying the original process group.</param>
     /// <param name="descendants">The captured descendant identities.</param>
     /// <returns><see langword="true"/> when all known daemon processes have exited.</returns>
     private static bool IsShutdownComplete(
@@ -672,6 +673,12 @@ public sealed class TestSshd : IDisposable
         }
     }
 
+    /// <summary>Identifies a process without relying on a PID that the operating system may reuse.</summary>
+    /// <param name="ProcessId">The process ID.</param>
+    /// <param name="ParentProcessId">The parent process ID.</param>
+    /// <param name="ProcessGroupId">The process-group ID.</param>
+    /// <param name="State">The process state from /proc.</param>
+    /// <param name="StartTime">The process start time from /proc.</param>
     private readonly record struct ProcessSnapshot(
         int ProcessId,
         int ParentProcessId,
@@ -679,6 +686,10 @@ public sealed class TestSshd : IDisposable
         char State,
         long StartTime);
 
+    /// <summary>Invokes the POSIX kill system call for a process or process group.</summary>
+    /// <param name="processId">A positive PID or a negative process-group ID.</param>
+    /// <param name="signal">The POSIX signal number.</param>
+    /// <returns>Zero on success; otherwise, -1 and a native error code.</returns>
     [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
     private static extern int NativeKill(int processId, int signal);
 }
