@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -68,8 +69,8 @@ public sealed class TestSshd : IDisposable
     /// <returns>The running fixture, or <see langword="null"/> when OpenSSH is unavailable or startup fails.</returns>
     private static TestSshd? StartOptional()
     {
-        // The fixture uses a non-privileged high port, disables PAM, and supplies
-        // its own host key. OpenSSH can therefore run as the test user without sudo.
+        // A non-privileged high port, an explicit host key, and disabled PAM let
+        // OpenSSH run as the test user without granting the test process sudo access.
         if (!OperatingSystem.IsLinux() ||
             !File.Exists("/usr/sbin/sshd") ||
             !File.Exists("/usr/bin/setsid") ||
@@ -229,7 +230,7 @@ public sealed class TestSshd : IDisposable
         psi.ArgumentList.Add("-T");
         psi.ArgumentList.Add("1");
         psi.ArgumentList.Add("-p");
-        psi.ArgumentList.Add(port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add(port.ToString(CultureInfo.InvariantCulture));
         psi.ArgumentList.Add("-t");
         psi.ArgumentList.Add("ed25519");
         psi.ArgumentList.Add("127.0.0.1");
@@ -338,32 +339,150 @@ public sealed class TestSshd : IDisposable
         }
     }
 
-    /// <summary>Signals every process in the isolated SSH daemon process group and verifies that the group exits.</summary>
+    /// <summary>Stops the daemon and all captured descendants, including children in separate sessions.</summary>
     /// <param name="process">The daemon process started through <c>setsid</c>; its PID is the process-group ID.</param>
     /// <exception cref="InvalidOperationException">A descendant remains alive after termination is requested.</exception>
-    /// <exception cref="Win32Exception">The process group cannot be inspected or signalled.</exception>
+    /// <exception cref="Win32Exception">The process tree cannot be inspected or signalled.</exception>
     private static void StopProcessGroup(Process process)
     {
         var processGroupId = process.Id;
-        SignalProcessGroup(processGroupId, SigTerm);
+        var descendants = GetProcessTree(processGroupId);
 
-        if (!WaitForProcessGroupExit(processGroupId, ProcessStopTimeout))
+        SignalProcessGroup(processGroupId, SigTerm);
+        SignalProcesses(descendants, SigTerm);
+
+        if (!WaitForShutdown(process, processGroupId, descendants, ProcessStopTimeout))
         {
             SignalProcessGroup(processGroupId, SigKill);
-            if (!WaitForProcessGroupExit(processGroupId, ProcessStopTimeout))
+            SignalProcesses(descendants, SigKill);
+            if (!WaitForShutdown(process, processGroupId, descendants, ProcessStopTimeout))
             {
                 throw new InvalidOperationException(
-                    $"SSH daemon process group {processGroupId} still has live processes after SIGKILL.");
+                    $"SSH daemon process group {processGroupId} or one of its descendants is still running after SIGKILL.");
             }
-        }
-
-        if (!process.HasExited && !process.WaitForExit((int)ProcessStopTimeout.TotalMilliseconds))
-        {
-            throw new InvalidOperationException($"SSH daemon process {processGroupId} did not exit.");
         }
     }
 
-    /// <summary>Sends a signal to a process group, treating an already-exited group as successfully stopped.</summary>
+    /// <summary>Captures the daemon's current descendants with process start times to avoid PID-reuse mistakes.</summary>
+    /// <param name="rootProcessId">The daemon process ID.</param>
+    /// <returns>A snapshot of all descendants visible in /proc.</returns>
+    private static List<ProcessSnapshot> GetProcessTree(int rootProcessId)
+    {
+        var processes = new Dictionary<int, ProcessSnapshot>();
+        foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(processDirectory), NumberStyles.None, CultureInfo.InvariantCulture, out var processId))
+            {
+                continue;
+            }
+
+            var snapshot = TryReadProcessSnapshot(processId);
+            if (snapshot is not null)
+            {
+                processes[processId] = snapshot.Value;
+            }
+        }
+
+        var childrenByParent = processes.Values
+            .GroupBy(snapshot => snapshot.ParentProcessId)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+
+        var descendants = new List<ProcessSnapshot>();
+        var visited = new HashSet<int> { rootProcessId };
+        var pending = new Stack<int>();
+        pending.Push(rootProcessId);
+
+        while (pending.Count > 0)
+        {
+            var parentProcessId = pending.Pop();
+            if (!childrenByParent.TryGetValue(parentProcessId, out var children))
+            {
+                continue;
+            }
+
+            foreach (var child in children)
+            {
+                if (visited.Add(child.ProcessId))
+                {
+                    descendants.Add(child);
+                    pending.Push(child.ProcessId);
+                }
+            }
+        }
+
+        return descendants;
+    }
+
+    /// <summary>Reads a process identity from /proc, returning null if the process exits during inspection.</summary>
+    /// <param name="processId">The process ID.</param>
+    /// <returns>The process identity, or <see langword="null"/> when it is no longer available.</returns>
+    private static ProcessSnapshot? TryReadProcessSnapshot(int processId)
+    {
+        try
+        {
+            var stat = File.ReadAllText($"/proc/{processId}/stat");
+            var closingParenthesis = stat.LastIndexOf(')');
+            if (closingParenthesis < 0)
+            {
+                return null;
+            }
+
+            var fields = stat[(closingParenthesis + 2)..]
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length <= 19 ||
+                !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var parentProcessId) ||
+                !int.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var processGroupId) ||
+                !long.TryParse(fields[19], NumberStyles.None, CultureInfo.InvariantCulture, out var startTime))
+            {
+                return null;
+            }
+
+            return new ProcessSnapshot(processId, parentProcessId, processGroupId, fields[0][0], startTime);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Sends a signal to every captured descendant that still has the same process identity.</summary>
+    /// <param name="processes">The process snapshots to signal.</param>
+    /// <param name="signal">The POSIX signal number.</param>
+    private static void SignalProcesses(IEnumerable<ProcessSnapshot> processes, int signal)
+    {
+        foreach (var process in processes)
+        {
+            SignalProcess(process, signal);
+        }
+    }
+
+    /// <summary>Sends a signal only when the PID still refers to the captured process, not a reused PID.</summary>
+    /// <param name="process">The captured process identity.</param>
+    /// <param name="signal">The POSIX signal number.</param>
+    private static void SignalProcess(ProcessSnapshot process, int signal)
+    {
+        if (!IsSameLiveProcess(process))
+        {
+            return;
+        }
+
+        if (NativeKill(process.ProcessId, signal) == 0)
+        {
+            return;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error != NoSuchProcess)
+        {
+            throw new Win32Exception(error, $"Failed to signal SSH fixture descendant {process.ProcessId}.");
+        }
+    }
+
+    /// <summary>Signals a process group, treating an already-exited group as successfully stopped.</summary>
     /// <param name="processGroupId">The process-group ID.</param>
     /// <param name="signal">The POSIX signal number.</param>
     private static void SignalProcessGroup(int processGroupId, int signal)
@@ -380,40 +499,57 @@ public sealed class TestSshd : IDisposable
         }
     }
 
-    /// <summary>Checks whether a process group still contains any process.</summary>
-    /// <param name="processGroupId">The process-group ID.</param>
-    /// <returns><see langword="true"/> when the group exists or access is denied; otherwise, <see langword="false"/>.</returns>
-    private static bool IsProcessGroupRunning(int processGroupId)
+    /// <summary>Checks whether the captured process still exists with the same start time and is not a zombie.</summary>
+    /// <param name="process">The captured process identity.</param>
+    /// <returns><see langword="true"/> when the same process is still live.</returns>
+    private static bool IsSameLiveProcess(ProcessSnapshot process)
     {
-        if (NativeKill(-processGroupId, 0) == 0)
-        {
-            return true;
-        }
-
-        var error = Marshal.GetLastPInvokeError();
-        if (error == NoSuchProcess)
-        {
-            return false;
-        }
-
-        if (error == PermissionDenied)
-        {
-            return true;
-        }
-
-        throw new Win32Exception(error, $"Failed to inspect SSH daemon process group {processGroupId}.");
+        var current = TryReadProcessSnapshot(process.ProcessId);
+        return current is not null &&
+               current.Value.StartTime == process.StartTime &&
+               current.Value.State is not ('Z' or 'X');
     }
 
-    /// <summary>Waits for all processes in a process group to exit.</summary>
+    /// <summary>Checks whether the daemon's isolated process group still has a live member.</summary>
     /// <param name="processGroupId">The process-group ID.</param>
+    /// <returns><see langword="true"/> when a non-zombie process remains in the group.</returns>
+    private static bool IsProcessGroupRunning(int processGroupId)
+    {
+        foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(processDirectory), NumberStyles.None, CultureInfo.InvariantCulture, out var processId))
+            {
+                continue;
+            }
+
+            var snapshot = TryReadProcessSnapshot(processId);
+            if (snapshot is not null &&
+                snapshot.Value.ProcessGroupId == processGroupId &&
+                snapshot.Value.State is not ('Z' or 'X'))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Waits until the daemon, its process group, and every captured descendant have exited.</summary>
+    /// <param name="process">The daemon process handle.</param>
+    /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <param name="descendants">The captured descendant identities.</param>
     /// <param name="timeout">The maximum wait duration.</param>
-    /// <returns><see langword="true"/> when the group no longer exists before the timeout.</returns>
-    private static bool WaitForProcessGroupExit(int processGroupId, TimeSpan timeout)
+    /// <returns><see langword="true"/> when no live daemon process or captured descendant remains.</returns>
+    private static bool WaitForShutdown(
+        Process process,
+        int processGroupId,
+        IReadOnlyCollection<ProcessSnapshot> descendants,
+        TimeSpan timeout)
     {
         var deadline = Stopwatch.StartNew();
         while (deadline.Elapsed < timeout)
         {
-            if (!IsProcessGroupRunning(processGroupId))
+            if (IsShutdownComplete(process, processGroupId, descendants))
             {
                 return true;
             }
@@ -421,7 +557,25 @@ public sealed class TestSshd : IDisposable
             Thread.Sleep(50);
         }
 
-        return !IsProcessGroupRunning(processGroupId);
+        return IsShutdownComplete(process, processGroupId, descendants);
+    }
+
+    /// <summary>Checks all known process identities before allowing fixture files to be deleted.</summary>
+    /// <param name="process">The daemon process handle.</param>
+    /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <param name="descendants">The captured descendant identities.</param>
+    /// <returns><see langword="true"/> when all known daemon processes have exited.</returns>
+    private static bool IsShutdownComplete(
+        Process process,
+        int processGroupId,
+        IReadOnlyCollection<ProcessSnapshot> descendants)
+    {
+        if (!process.HasExited || IsProcessGroupRunning(processGroupId))
+        {
+            return false;
+        }
+
+        return !descendants.Any(IsSameLiveProcess);
     }
 
     /// <summary>Attempts to remove the fixture's temporary directory without masking an earlier failure.</summary>
@@ -463,6 +617,13 @@ public sealed class TestSshd : IDisposable
             }
         }
     }
+
+    private readonly record struct ProcessSnapshot(
+        int ProcessId,
+        int ParentProcessId,
+        int ProcessGroupId,
+        char State,
+        long StartTime);
 
     [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
     private static extern int NativeKill(int processId, int signal);
