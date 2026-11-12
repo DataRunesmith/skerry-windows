@@ -52,7 +52,7 @@ jobs:
       - name: Install OpenSSH server for integration tests
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y openssh-server
+          sudo apt-get install --no-install-recommends -y openssh-server openssh-client util-linux
           sudo mkdir -p /run/sshd
           sudo chmod 0755 /run/sshd
 
