@@ -24,7 +24,7 @@ public sealed class TestSshd : IDisposable
 
     private readonly Process _process;
     private readonly DirectoryInfo _directory;
-    private readonly long _processGroupStartTime;
+    private readonly ProcessGroupState _processGroupState;
 
     /// <summary>Gets the local TCP port used by the test SSH server.</summary>
     public int Port { get; }
@@ -37,11 +37,11 @@ public sealed class TestSshd : IDisposable
     /// <param name="directory">The temporary directory containing the daemon configuration and keys.</param>
     /// <param name="port">The local TCP port bound by the daemon.</param>
     /// <param name="clientKeyPath">The private key path used by test clients.</param>
-    private TestSshd(Process process, DirectoryInfo directory, int port, string clientKeyPath, long processGroupStartTime)
+    private TestSshd(Process process, DirectoryInfo directory, int port, string clientKeyPath, ProcessGroupState processGroupState)
     {
         _process = process;
         _directory = directory;
-        _processGroupStartTime = processGroupStartTime;
+        _processGroupState = processGroupState;
         Port = port;
         ClientKeyPath = clientKeyPath;
     }
@@ -83,6 +83,7 @@ public sealed class TestSshd : IDisposable
         DirectoryInfo? directory = Directory.CreateTempSubdirectory("skerry-sshd-");
         var dir = directory.FullName;
         Process? server = null;
+        ProcessGroupState? serverState = null;
 
         try
         {
@@ -130,22 +131,25 @@ public sealed class TestSshd : IDisposable
                     continue;
                 }
 
+                serverState = new ProcessGroupState(server.Id);
                 if (WaitForServer(server, port, hostKey))
                 {
                     var processSnapshot = TryReadProcessSnapshot(server.Id);
                     if (processSnapshot is not null && processSnapshot.Value.ProcessGroupId == server.Id)
                     {
-                        var fixture = new TestSshd(
-                            server, directory, port, clientKey, processSnapshot.Value.StartTime);
-                        server = null;    // Ownership transfers to the fixture.
-                        directory = null; // The fixture now owns the directory.
+                        serverState.StartTime = processSnapshot.Value.StartTime;
+                        var fixture = new TestSshd(server, directory, port, clientKey, serverState);
+                        server = null;       // Ownership transfers to the fixture.
+                        serverState = null;
+                        directory = null;    // The fixture now owns the directory.
                         return fixture;
                     }
                 }
 
-                StopProcessGroup(server);
+                StopProcessGroup(server, serverState);
                 server.Dispose();
                 server = null;
+                serverState = null;
             }
 
             return null;
@@ -162,7 +166,8 @@ public sealed class TestSshd : IDisposable
             {
                 if (server is not null)
                 {
-                    StopProcessGroup(server);
+                    serverState ??= new ProcessGroupState(server.Id);
+                    StopProcessGroup(server, serverState);
                     serverStopped = true;
                 }
             }
@@ -349,12 +354,12 @@ public sealed class TestSshd : IDisposable
     /// <param name="process">The daemon process started through <c>setsid</c>; its PID is the process-group ID.</param>
     /// <exception cref="InvalidOperationException">A descendant remains alive after termination is requested.</exception>
     /// <exception cref="Win32Exception">The process tree cannot be inspected or signalled.</exception>
-    private static void StopProcessGroup(Process process, long? expectedStartTime = null)
+    private static void StopProcessGroup(Process process, ProcessGroupState state)
     {
-        var processGroupId = process.Id;
+        var processGroupId = state.ProcessGroupId;
         var root = TryReadProcessSnapshot(processGroupId);
 
-        if (expectedStartTime is null)
+        if (state.StartTime is null)
         {
             if (process.HasExited)
             {
@@ -369,30 +374,43 @@ public sealed class TestSshd : IDisposable
                 return;
             }
 
-            expectedStartTime = root.Value.StartTime;
-        }
-        else if (root is not null && root.Value.StartTime != expectedStartTime.Value)
-        {
-            // The original process exited and its numeric PID was reused.
-            return;
-        }
-        else if (root is not null && root.Value.ProcessGroupId != processGroupId)
-        {
-            throw new InvalidOperationException(
-                $"SSH daemon process {processGroupId} no longer belongs to its isolated process group.");
+            state.StartTime = root.Value.StartTime;
         }
 
-        var processGroupStartTime = expectedStartTime.Value;
-        var descendants = root is null ? new List<ProcessSnapshot>() : GetProcessTree(processGroupId);
-
-        SignalProcessGroup(processGroupId, processGroupStartTime, SigTerm);
-        SignalProcesses(descendants, SigTerm);
-
-        if (!WaitForShutdown(process, processGroupId, processGroupStartTime, descendants, ProcessStopTimeout))
+        var processGroupStartTime = state.StartTime.Value;
+        var groupIdentityMatches = root is null || root.Value.StartTime == processGroupStartTime;
+        if (groupIdentityMatches && root is not null)
         {
-            SignalProcessGroup(processGroupId, processGroupStartTime, SigKill);
-            SignalProcesses(descendants, SigKill);
-            if (!WaitForShutdown(process, processGroupId, processGroupStartTime, descendants, ProcessStopTimeout))
+            if (root.Value.ProcessGroupId != processGroupId)
+            {
+                throw new InvalidOperationException(
+                    $"SSH daemon process {processGroupId} no longer belongs to its isolated process group.");
+            }
+
+            // Capture descendants before signaling the listener. OpenSSH may move
+            // connection children into separate process groups during teardown.
+            state.AddDescendants(GetProcessTree(processGroupId));
+        }
+
+        // Keep the captured identities in state across retries. If the listener
+        // exits during a failed stop, a later finally-path retry must still
+        // terminate and verify descendants that have moved to other groups.
+        if (groupIdentityMatches)
+        {
+            SignalProcessGroup(processGroupId, processGroupStartTime, SigTerm);
+        }
+
+        SignalProcesses(state.Descendants, SigTerm);
+
+        if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Descendants, ProcessStopTimeout))
+        {
+            if (groupIdentityMatches)
+            {
+                SignalProcessGroup(processGroupId, processGroupStartTime, SigKill);
+            }
+
+            SignalProcesses(state.Descendants, SigKill);
+            if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Descendants, ProcessStopTimeout))
             {
                 throw new InvalidOperationException(
                     $"SSH daemon process group {processGroupId} or one of its descendants is still running after SIGKILL.");
@@ -660,7 +678,7 @@ public sealed class TestSshd : IDisposable
         var stopped = false;
         try
         {
-            StopProcessGroup(_process, _processGroupStartTime);
+            StopProcessGroup(_process, _processGroupState);
             stopped = true;
         }
         finally
@@ -669,6 +687,31 @@ public sealed class TestSshd : IDisposable
             if (stopped)
             {
                 TryDeleteDirectory(_directory);
+            }
+        }
+    }
+
+    /// <summary>Retains the identity and captured descendants of a daemon process group across stop attempts.</summary>
+    private sealed class ProcessGroupState
+    {
+        public ProcessGroupState(int processGroupId) => ProcessGroupId = processGroupId;
+
+        public int ProcessGroupId { get; }
+
+        public long? StartTime { get; set; }
+
+        public List<ProcessSnapshot> Descendants { get; } = new();
+
+        public void AddDescendants(IEnumerable<ProcessSnapshot> descendants)
+        {
+            foreach (var descendant in descendants)
+            {
+                if (!Descendants.Any(existing =>
+                        existing.ProcessId == descendant.ProcessId &&
+                        existing.StartTime == descendant.StartTime))
+                {
+                    Descendants.Add(descendant);
+                }
             }
         }
     }
