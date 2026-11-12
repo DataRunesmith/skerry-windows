@@ -28,6 +28,7 @@ jobs:
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
+          dotnet-quality: ga
 
       - name: Restore application
         run: dotnet restore WindowsApp/WindowsApp.csproj
@@ -48,6 +49,7 @@ jobs:
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
+          dotnet-quality: ga
 
       - name: Install OpenSSH server for integration tests
         run: |
