@@ -25,6 +25,7 @@ public sealed class TestSshd : IDisposable
 
     private readonly Process _process;
     private readonly DirectoryInfo _directory;
+    private readonly long _processGroupStartTime;
 
     /// <summary>Gets the local TCP port used by the test SSH server.</summary>
     public int Port { get; }
@@ -37,10 +38,11 @@ public sealed class TestSshd : IDisposable
     /// <param name="directory">The temporary directory containing the daemon configuration and keys.</param>
     /// <param name="port">The local TCP port bound by the daemon.</param>
     /// <param name="clientKeyPath">The private key path used by test clients.</param>
-    private TestSshd(Process process, DirectoryInfo directory, int port, string clientKeyPath)
+    private TestSshd(Process process, DirectoryInfo directory, int port, string clientKeyPath, long processGroupStartTime)
     {
         _process = process;
         _directory = directory;
+        _processGroupStartTime = processGroupStartTime;
         Port = port;
         ClientKeyPath = clientKeyPath;
     }
@@ -131,10 +133,15 @@ public sealed class TestSshd : IDisposable
 
                 if (WaitForServer(server, port, hostKey))
                 {
-                    var fixture = new TestSshd(server, directory, port, clientKey);
-                    server = null;    // Ownership transfers to the fixture.
-                    directory = null; // The fixture now owns the directory.
-                    return fixture;
+                    var processSnapshot = TryReadProcessSnapshot(server.Id);
+                    if (processSnapshot is not null && processSnapshot.Value.ProcessGroupId == server.Id)
+                    {
+                        var fixture = new TestSshd(
+                            server, directory, port, clientKey, processSnapshot.Value.StartTime);
+                        server = null;    // Ownership transfers to the fixture.
+                        directory = null; // The fixture now owns the directory.
+                        return fixture;
+                    }
                 }
 
                 StopProcessGroup(server);
@@ -343,19 +350,31 @@ public sealed class TestSshd : IDisposable
     /// <param name="process">The daemon process started through <c>setsid</c>; its PID is the process-group ID.</param>
     /// <exception cref="InvalidOperationException">A descendant remains alive after termination is requested.</exception>
     /// <exception cref="Win32Exception">The process tree cannot be inspected or signalled.</exception>
-    private static void StopProcessGroup(Process process)
+    private static void StopProcessGroup(Process process, long? expectedStartTime = null)
     {
-        var processGroupId = process.Id;
+        var processId = process.Id;
+        var root = TryReadProcessSnapshot(processId);
+        if (root is null || root.Value.ProcessGroupId != processId ||
+            (expectedStartTime is not null && root.Value.StartTime != expectedStartTime.Value))
+        {
+            // setsid may not have completed yet, or the process has already exited.
+            // In that case, never signal the caller's process group.
+            StopProcess(process);
+            return;
+        }
+
+        var processGroupId = processId;
+        var processGroupStartTime = root.Value.StartTime;
         var descendants = GetProcessTree(processGroupId);
 
-        SignalProcessGroup(processGroupId, SigTerm);
+        SignalProcessGroup(processGroupId, processGroupStartTime, SigTerm);
         SignalProcesses(descendants, SigTerm);
 
-        if (!WaitForShutdown(process, processGroupId, descendants, ProcessStopTimeout))
+        if (!WaitForShutdown(process, processGroupId, processGroupStartTime, descendants, ProcessStopTimeout))
         {
-            SignalProcessGroup(processGroupId, SigKill);
+            SignalProcessGroup(processGroupId, processGroupStartTime, SigKill);
             SignalProcesses(descendants, SigKill);
-            if (!WaitForShutdown(process, processGroupId, descendants, ProcessStopTimeout))
+            if (!WaitForShutdown(process, processGroupId, processGroupStartTime, descendants, ProcessStopTimeout))
             {
                 throw new InvalidOperationException(
                     $"SSH daemon process group {processGroupId} or one of its descendants is still running after SIGKILL.");
@@ -485,8 +504,15 @@ public sealed class TestSshd : IDisposable
     /// <summary>Signals a process group, treating an already-exited group as successfully stopped.</summary>
     /// <param name="processGroupId">The process-group ID.</param>
     /// <param name="signal">The POSIX signal number.</param>
-    private static void SignalProcessGroup(int processGroupId, int signal)
+    private static void SignalProcessGroup(int processGroupId, long processGroupStartTime, int signal)
     {
+        var leader = TryReadProcessSnapshot(processGroupId);
+        if (leader is not null && leader.Value.StartTime != processGroupStartTime)
+        {
+            // The original group has exited and its numeric ID has been reused.
+            return;
+        }
+
         if (NativeKill(-processGroupId, signal) == 0)
         {
             return;
@@ -513,8 +539,15 @@ public sealed class TestSshd : IDisposable
     /// <summary>Checks whether the daemon's isolated process group still has a live member.</summary>
     /// <param name="processGroupId">The process-group ID.</param>
     /// <returns><see langword="true"/> when a non-zombie process remains in the group.</returns>
-    private static bool IsProcessGroupRunning(int processGroupId)
+    private static bool IsProcessGroupRunning(int processGroupId, long processGroupStartTime)
     {
+        var leader = TryReadProcessSnapshot(processGroupId);
+        if (leader is not null && leader.Value.StartTime != processGroupStartTime)
+        {
+            // The original group has exited and its numeric ID has been reused.
+            return false;
+        }
+
         foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
         {
             if (!int.TryParse(Path.GetFileName(processDirectory), NumberStyles.None, CultureInfo.InvariantCulture, out var processId))
@@ -543,13 +576,14 @@ public sealed class TestSshd : IDisposable
     private static bool WaitForShutdown(
         Process process,
         int processGroupId,
+        long processGroupStartTime,
         IReadOnlyCollection<ProcessSnapshot> descendants,
         TimeSpan timeout)
     {
         var deadline = Stopwatch.StartNew();
         while (deadline.Elapsed < timeout)
         {
-            if (IsShutdownComplete(process, processGroupId, descendants))
+            if (IsShutdownComplete(process, processGroupId, processGroupStartTime, descendants))
             {
                 return true;
             }
@@ -557,7 +591,7 @@ public sealed class TestSshd : IDisposable
             Thread.Sleep(50);
         }
 
-        return IsShutdownComplete(process, processGroupId, descendants);
+        return IsShutdownComplete(process, processGroupId, processGroupStartTime, descendants);
     }
 
     /// <summary>Checks all known process identities before allowing fixture files to be deleted.</summary>
@@ -568,9 +602,10 @@ public sealed class TestSshd : IDisposable
     private static bool IsShutdownComplete(
         Process process,
         int processGroupId,
+        long processGroupStartTime,
         IReadOnlyCollection<ProcessSnapshot> descendants)
     {
-        if (!process.HasExited || IsProcessGroupRunning(processGroupId))
+        if (!process.HasExited || IsProcessGroupRunning(processGroupId, processGroupStartTime))
         {
             return false;
         }
@@ -605,7 +640,7 @@ public sealed class TestSshd : IDisposable
         var stopped = false;
         try
         {
-            StopProcessGroup(_process);
+            StopProcessGroup(_process, _processGroupStartTime);
             stopped = true;
         }
         finally
