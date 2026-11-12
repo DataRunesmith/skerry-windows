@@ -352,20 +352,39 @@ public sealed class TestSshd : IDisposable
     /// <exception cref="Win32Exception">The process tree cannot be inspected or signalled.</exception>
     private static void StopProcessGroup(Process process, long? expectedStartTime = null)
     {
-        var processId = process.Id;
-        var root = TryReadProcessSnapshot(processId);
-        if (root is null || root.Value.ProcessGroupId != processId ||
-            (expectedStartTime is not null && root.Value.StartTime != expectedStartTime.Value))
+        var processGroupId = process.Id;
+        var root = TryReadProcessSnapshot(processGroupId);
+
+        if (expectedStartTime is null)
         {
-            // setsid may not have completed yet, or the process has already exited.
-            // In that case, never signal the caller's process group.
-            StopProcess(process);
+            if (process.HasExited)
+            {
+                return;
+            }
+
+            if (root is null || root.Value.ProcessGroupId != processGroupId)
+            {
+                // setsid has not established an isolated group yet. Never signal
+                // the caller's process group while startup is still in progress.
+                StopProcess(process);
+                return;
+            }
+
+            expectedStartTime = root.Value.StartTime;
+        }
+        else if (root is not null && root.Value.StartTime != expectedStartTime.Value)
+        {
+            // The original process exited and its numeric PID was reused.
             return;
         }
+        else if (root is not null && root.Value.ProcessGroupId != processGroupId)
+        {
+            throw new InvalidOperationException(
+                $"SSH daemon process {processGroupId} no longer belongs to its isolated process group.");
+        }
 
-        var processGroupId = processId;
-        var processGroupStartTime = root.Value.StartTime;
-        var descendants = GetProcessTree(processGroupId);
+        var processGroupStartTime = expectedStartTime.Value;
+        var descendants = root is null ? new List<ProcessSnapshot>() : GetProcessTree(processGroupId);
 
         SignalProcessGroup(processGroupId, processGroupStartTime, SigTerm);
         SignalProcesses(descendants, SigTerm);
