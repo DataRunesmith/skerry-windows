@@ -1,10 +1,10 @@
 name: Windows CI
 
 on:
-  pull_request:
-    branches: [main]
+  # Run on branch pushes so this workflow can validate its own introduction in a PR.
+  # Push-triggered job checks are also eligible for pull-request status checks.
   push:
-    branches: [main]
+    branches: ['**']
 
 permissions:
   contents: read
