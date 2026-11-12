@@ -648,3 +648,6 @@ bin/
 obj/
 *.user
 .vs/
+
+# Local Claude Code statusline script, kept outside the repository
+statusline.sh
