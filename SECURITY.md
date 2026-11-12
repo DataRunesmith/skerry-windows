@@ -14,8 +14,12 @@ currently being supported with security updates.
 
 ## Reporting a Vulnerability
 
-Use this section to tell people how to report a vulnerability.
+<!-- coderabbit-ai-generated:v1 -->
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+<!-- coderabbit-ai-generated-section:v1:a364d59336dcc526ab166e583e1886e179fab065db750490faaea4bc315e184a -->
+
+Report suspected vulnerabilities privately using [GitHub private vulnerability reporting](https://github.com/DataRunesmith/skerry-windows/security/advisories/new).
+
+Include the affected version, reproduction steps, and potential impact. Do not disclose vulnerability details in a public issue.
+
+<!-- /coderabbit-ai-generated:v1 -->
