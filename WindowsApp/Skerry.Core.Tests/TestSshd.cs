@@ -134,7 +134,7 @@ public sealed class TestSshd : IDisposable
                 serverState = new ProcessGroupState(server.Id);
                 if (WaitForServer(server, port, hostKey))
                 {
-                    var processSnapshot = TryReadProcessSnapshot(server.Id);
+                    var processSnapshot = ReadCapturedProcessSnapshot(server.Id);
                     if (processSnapshot is not null && processSnapshot.Value.ProcessGroupId == server.Id)
                     {
                         serverState.StartTime = processSnapshot.Value.StartTime;
@@ -357,7 +357,7 @@ public sealed class TestSshd : IDisposable
     private static void StopProcessGroup(Process process, ProcessGroupState state)
     {
         var processGroupId = state.ProcessGroupId;
-        var root = TryReadProcessSnapshot(processGroupId);
+        var root = ReadCapturedProcessSnapshot(processGroupId);
 
         if (state.StartTime is null)
         {
@@ -468,10 +468,11 @@ public sealed class TestSshd : IDisposable
         return descendants;
     }
 
-    /// <summary>Reads a process identity from /proc, returning null if the process exits during inspection.</summary>
+    /// <summary>Reads a process identity, returning null only when the process disappears during inspection.</summary>
     /// <param name="processId">The process ID.</param>
-    /// <returns>The process identity, or <see langword="null"/> when it is no longer available.</returns>
-    private static ProcessSnapshot? TryReadProcessSnapshot(int processId)
+    /// <returns>The process identity, or <see langword="null"/> when the process no longer exists.</returns>
+    /// <exception cref="InvalidOperationException">The process stat data is malformed.</exception>
+    private static ProcessSnapshot? ReadProcessSnapshot(int processId)
     {
         try
         {
@@ -479,7 +480,7 @@ public sealed class TestSshd : IDisposable
             var closingParenthesis = stat.LastIndexOf(')');
             if (closingParenthesis < 0)
             {
-                return null;
+                throw new InvalidOperationException($"Process {processId} has malformed /proc stat data.");
             }
 
             var fields = stat[(closingParenthesis + 2)..]
@@ -489,16 +490,59 @@ public sealed class TestSshd : IDisposable
                 !int.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var processGroupId) ||
                 !long.TryParse(fields[19], NumberStyles.None, CultureInfo.InvariantCulture, out var startTime))
             {
-                return null;
+                throw new InvalidOperationException($"Process {processId} has malformed /proc stat fields.");
             }
 
             return new ProcessSnapshot(processId, parentProcessId, processGroupId, fields[0][0], startTime);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Reads a captured process identity and fails if the process cannot be inspected.</summary>
+    /// <param name="processId">The captured process ID.</param>
+    /// <returns>The process identity, or <see langword="null"/> when the process has exited.</returns>
+    /// <exception cref="InvalidOperationException">The process cannot be inspected reliably.</exception>
+    private static ProcessSnapshot? ReadCapturedProcessSnapshot(int processId)
+    {
+        try
+        {
+            return ReadProcessSnapshot(processId);
+        }
+        catch (IOException exception)
+        {
+            throw new InvalidOperationException($"Unable to inspect captured process {processId}.", exception);
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            throw new InvalidOperationException($"Access denied while inspecting captured process {processId}.", exception);
+        }
+    }
+
+    /// <summary>Best-effort process inspection for unrelated entries discovered while enumerating /proc.</summary>
+    /// <param name="processId">The process ID.</param>
+    /// <returns>The process identity, or <see langword="null"/> when it disappears or cannot be inspected.</returns>
+    private static ProcessSnapshot? TryReadProcessSnapshot(int processId)
+    {
+        try
+        {
+            return ReadProcessSnapshot(processId);
         }
         catch (IOException)
         {
             return null;
         }
         catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
         {
             return null;
         }
@@ -542,7 +586,7 @@ public sealed class TestSshd : IDisposable
     /// <param name="signal">The POSIX signal number.</param>
     private static void SignalProcessGroup(int processGroupId, long processGroupStartTime, int signal)
     {
-        var leader = TryReadProcessSnapshot(processGroupId);
+        var leader = ReadCapturedProcessSnapshot(processGroupId);
         if (leader is not null && leader.Value.StartTime != processGroupStartTime)
         {
             // The original group has exited and its numeric ID has been reused.
@@ -566,7 +610,7 @@ public sealed class TestSshd : IDisposable
     /// <returns><see langword="true"/> when the same process is still live.</returns>
     private static bool IsSameLiveProcess(ProcessSnapshot process)
     {
-        var current = TryReadProcessSnapshot(process.ProcessId);
+        var current = ReadCapturedProcessSnapshot(process.ProcessId);
         return current is not null &&
                current.Value.StartTime == process.StartTime &&
                current.Value.State is not ('Z' or 'X');
@@ -577,7 +621,7 @@ public sealed class TestSshd : IDisposable
     /// <returns><see langword="true"/> when a non-zombie process remains in the group.</returns>
     private static bool IsProcessGroupRunning(int processGroupId, long processGroupStartTime)
     {
-        var leader = TryReadProcessSnapshot(processGroupId);
+        var leader = ReadCapturedProcessSnapshot(processGroupId);
         if (leader is not null && leader.Value.StartTime != processGroupStartTime)
         {
             // The original group has exited and its numeric ID has been reused.
