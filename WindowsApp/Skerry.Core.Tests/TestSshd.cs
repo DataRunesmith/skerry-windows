@@ -17,6 +17,8 @@ public sealed class TestSshd : IDisposable
     private const int SigTerm = 15;
     private const int SigKill = 9;
     private const int NoSuchProcess = 3;
+    private const long PidfdSendSignalSyscall = 424;
+    private const long PidfdOpenSyscall = 434;
 
     private static readonly TimeSpan KeygenTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(5);
@@ -60,7 +62,7 @@ public sealed class TestSshd : IDisposable
                 Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
-                "Failed to start the test SSH server in CI. Check that openssh-server and ssh-keygen are installed.");
+                "Failed to start the test SSH server in CI. Check openssh-server, openssh-client, util-linux, and Linux pidfd support.");
         }
 
         return fixture;
@@ -75,12 +77,26 @@ public sealed class TestSshd : IDisposable
         if (!OperatingSystem.IsLinux() ||
             !File.Exists("/usr/sbin/sshd") ||
             !File.Exists("/usr/bin/setsid") ||
-            !File.Exists("/usr/bin/ssh-keyscan"))
+            !File.Exists("/usr/bin/ssh-keyscan") ||
+            !SupportsPidFd())
         {
             return null;
         }
 
-        DirectoryInfo? directory = Directory.CreateTempSubdirectory("skerry-sshd-");
+        DirectoryInfo? directory;
+        try
+        {
+            directory = Directory.CreateTempSubdirectory("skerry-sshd-");
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+
         var dir = directory.FullName;
         Process? server = null;
         ProcessGroupState? serverState = null;
@@ -350,10 +366,10 @@ public sealed class TestSshd : IDisposable
         }
     }
 
-    /// <summary>Stops the daemon and all captured descendants, including children in separate sessions.</summary>
+    /// <summary>Stops the daemon and all captured descendants and process-group members.</summary>
     /// <param name="process">The daemon process started through <c>setsid</c>; its PID is the process-group ID.</param>
-    /// <exception cref="InvalidOperationException">A descendant remains alive after termination is requested.</exception>
-    /// <exception cref="Win32Exception">The process tree cannot be inspected or signalled.</exception>
+    /// <exception cref="InvalidOperationException">A captured process remains alive after termination is requested.</exception>
+    /// <exception cref="Win32Exception">A captured process cannot be inspected or signalled.</exception>
     private static void StopProcessGroup(Process process, ProcessGroupState state)
     {
         var processGroupId = state.ProcessGroupId;
@@ -379,49 +395,40 @@ public sealed class TestSshd : IDisposable
 
         var processGroupStartTime = state.StartTime.Value;
         var groupIdentityMatches = root is null || root.Value.StartTime == processGroupStartTime;
-        if (groupIdentityMatches && root is not null)
+        if (groupIdentityMatches)
         {
-            if (root.Value.ProcessGroupId != processGroupId)
+            if (root is not null && root.Value.ProcessGroupId != processGroupId)
             {
                 throw new InvalidOperationException(
                     $"SSH daemon process {processGroupId} no longer belongs to its isolated process group.");
             }
 
-            // Capture descendants before signaling the listener. OpenSSH may move
-            // connection children into separate process groups during teardown.
-            state.AddDescendants(GetProcessTree(processGroupId));
+            // Capture the listener, all members of its process group, and its
+            // descendants before signalling. OpenSSH may move connection
+            // children into separate process groups or reparent them.
+            state.AddProcesses(CaptureRelatedProcesses(processGroupId, processGroupId));
         }
 
-        // Keep the captured identities in state across retries. If the listener
-        // exits during a failed stop, a later finally-path retry must still
-        // terminate and verify descendants that have moved to other groups.
-        if (groupIdentityMatches)
+        // Keep identity-bound process handles across retries. A pidfd prevents a
+        // reused numeric PID from receiving a signal intended for an old process.
+        SignalProcesses(state.Processes, SigTerm);
+
+        if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Processes, ProcessStopTimeout))
         {
-            SignalProcessGroup(processGroupId, processGroupStartTime, SigTerm);
-        }
-
-        SignalProcesses(state.Descendants, SigTerm);
-
-        if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Descendants, ProcessStopTimeout))
-        {
-            if (groupIdentityMatches)
-            {
-                SignalProcessGroup(processGroupId, processGroupStartTime, SigKill);
-            }
-
-            SignalProcesses(state.Descendants, SigKill);
-            if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Descendants, ProcessStopTimeout))
+            SignalProcesses(state.Processes, SigKill);
+            if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Processes, ProcessStopTimeout))
             {
                 throw new InvalidOperationException(
-                    $"SSH daemon process group {processGroupId} or one of its descendants is still running after SIGKILL.");
+                    $"SSH daemon process group {processGroupId} or one of its captured processes is still running after SIGKILL.");
             }
         }
     }
 
-    /// <summary>Captures the daemon's current descendants with process start times to avoid PID-reuse mistakes.</summary>
+    /// <summary>Captures the daemon's descendants and process-group members in one /proc snapshot.</summary>
     /// <param name="rootProcessId">The daemon process ID.</param>
-    /// <returns>A snapshot of all descendants visible in /proc.</returns>
-    private static List<ProcessSnapshot> GetProcessTree(int rootProcessId)
+    /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <returns>All related process identities visible in /proc.</returns>
+    private static List<ProcessSnapshot> CaptureRelatedProcesses(int rootProcessId, int processGroupId)
     {
         var processes = new Dictionary<int, ProcessSnapshot>();
         foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
@@ -438,11 +445,16 @@ public sealed class TestSshd : IDisposable
             }
         }
 
+        var related = new Dictionary<(int ProcessId, long StartTime), ProcessSnapshot>();
+        foreach (var snapshot in processes.Values.Where(snapshot => snapshot.ProcessGroupId == processGroupId))
+        {
+            related[(snapshot.ProcessId, snapshot.StartTime)] = snapshot;
+        }
+
         var childrenByParent = processes.Values
             .GroupBy(snapshot => snapshot.ParentProcessId)
             .ToDictionary(group => group.Key, group => group.ToArray());
 
-        var descendants = new List<ProcessSnapshot>();
         var visited = new HashSet<int> { rootProcessId };
         var pending = new Stack<int>();
         pending.Push(rootProcessId);
@@ -459,13 +471,13 @@ public sealed class TestSshd : IDisposable
             {
                 if (visited.Add(child.ProcessId))
                 {
-                    descendants.Add(child);
+                    related[(child.ProcessId, child.StartTime)] = child;
                     pending.Push(child.ProcessId);
                 }
             }
         }
 
-        return descendants;
+        return related.Values.ToList();
     }
 
     /// <summary>Reads a process identity, returning null only when the process disappears during inspection.</summary>
@@ -548,7 +560,7 @@ public sealed class TestSshd : IDisposable
         }
     }
 
-    /// <summary>Sends a signal to every captured descendant that still has the same process identity.</summary>
+    /// <summary>Sends a signal to every captured process using an identity-bound pidfd.</summary>
     /// <param name="processes">The process snapshots to signal.</param>
     /// <param name="signal">The POSIX signal number.</param>
     private static void SignalProcesses(IEnumerable<ProcessSnapshot> processes, int signal)
@@ -559,49 +571,99 @@ public sealed class TestSshd : IDisposable
         }
     }
 
-    /// <summary>Sends a signal only when the PID still refers to the captured process, not a reused PID.</summary>
+    /// <summary>Sends a signal through a pidfd so PID reuse cannot redirect it to another process.</summary>
     /// <param name="process">The captured process identity.</param>
     /// <param name="signal">The POSIX signal number.</param>
     private static void SignalProcess(ProcessSnapshot process, int signal)
     {
-        if (!IsSameLiveProcess(process))
+        var pidfd = OpenPidFd(process.ProcessId);
+        if (pidfd < 0)
         {
             return;
         }
 
-        if (NativeKill(process.ProcessId, signal) == 0)
+        try
         {
-            return;
-        }
+            if (!IsSameLiveProcess(process))
+            {
+                return;
+            }
 
-        var error = Marshal.GetLastPInvokeError();
-        if (error != NoSuchProcess)
+            if (NativeSyscall(PidfdSendSignalSyscall, pidfd, signal, IntPtr.Zero, 0u) == 0)
+            {
+                return;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error != NoSuchProcess)
+            {
+                throw new Win32Exception(error, $"Failed to signal SSH fixture process {process.ProcessId}.");
+            }
+        }
+        finally
         {
-            throw new Win32Exception(error, $"Failed to signal SSH fixture descendant {process.ProcessId}.");
+            _ = NativeClose(pidfd);
         }
     }
 
-    /// <summary>Signals a process group, treating an already-exited group as successfully stopped.</summary>
-    /// <param name="processGroupId">The process-group ID.</param>
-    /// <param name="signal">The POSIX signal number.</param>
-    private static void SignalProcessGroup(int processGroupId, long processGroupStartTime, int signal)
+    /// <summary>Opens a pidfd for a process, returning -1 if it has already exited.</summary>
+    /// <param name="processId">The process ID.</param>
+    /// <returns>A pidfd, or -1 when the process no longer exists.</returns>
+    private static int OpenPidFd(int processId)
     {
-        var leader = ReadCapturedProcessSnapshot(processGroupId);
-        if (leader is not null && leader.Value.StartTime != processGroupStartTime)
+        var result = NativeSyscall(PidfdOpenSyscall, processId, 0u);
+        if (result >= 0)
         {
-            // The original group has exited and its numeric ID has been reused.
-            return;
-        }
-
-        if (NativeKill(-processGroupId, signal) == 0)
-        {
-            return;
+            return checked((int)result);
         }
 
         var error = Marshal.GetLastPInvokeError();
-        if (error != NoSuchProcess)
+        if (error == NoSuchProcess)
         {
-            throw new Win32Exception(error, $"Failed to signal SSH daemon process group {processGroupId}.");
+            return -1;
+        }
+
+        throw new Win32Exception(error, $"Failed to open a pidfd for SSH fixture process {processId}.");
+    }
+
+    /// <summary>Checks that the Linux kernel permits pidfd-based process signalling.</summary>
+    private static bool SupportsPidFd()
+    {
+        int pidfd;
+        try
+        {
+            var result = NativeSyscall(PidfdOpenSyscall, Environment.ProcessId, 0u);
+            if (result < 0)
+            {
+                return false;
+            }
+
+            pidfd = checked((int)result);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+
+        try
+        {
+            return NativeSyscall(PidfdSendSignalSyscall, pidfd, 0, IntPtr.Zero, 0u) == 0;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        finally
+        {
+            _ = NativeClose(pidfd);
         }
     }
 
@@ -658,13 +720,13 @@ public sealed class TestSshd : IDisposable
         Process process,
         int processGroupId,
         long processGroupStartTime,
-        IReadOnlyCollection<ProcessSnapshot> descendants,
+        IReadOnlyCollection<ProcessSnapshot> processes,
         TimeSpan timeout)
     {
         var deadline = Stopwatch.StartNew();
         while (deadline.Elapsed < timeout)
         {
-            if (IsShutdownComplete(process, processGroupId, processGroupStartTime, descendants))
+            if (IsShutdownComplete(process, processGroupId, processGroupStartTime, processes))
             {
                 return true;
             }
@@ -672,7 +734,7 @@ public sealed class TestSshd : IDisposable
             Thread.Sleep(50);
         }
 
-        return IsShutdownComplete(process, processGroupId, processGroupStartTime, descendants);
+        return IsShutdownComplete(process, processGroupId, processGroupStartTime, processes);
     }
 
     /// <summary>Checks all known process identities before allowing fixture files to be deleted.</summary>
@@ -685,14 +747,14 @@ public sealed class TestSshd : IDisposable
         Process process,
         int processGroupId,
         long processGroupStartTime,
-        IReadOnlyCollection<ProcessSnapshot> descendants)
+        IReadOnlyCollection<ProcessSnapshot> processes)
     {
         if (!process.HasExited || IsProcessGroupRunning(processGroupId, processGroupStartTime))
         {
             return false;
         }
 
-        return !descendants.Any(IsSameLiveProcess);
+        return !processes.Any(IsSameLiveProcess);
     }
 
     /// <summary>Attempts to remove the fixture's temporary directory without masking an earlier failure.</summary>
@@ -744,17 +806,17 @@ public sealed class TestSshd : IDisposable
 
         public long? StartTime { get; set; }
 
-        public List<ProcessSnapshot> Descendants { get; } = new();
+        public List<ProcessSnapshot> Processes { get; } = new();
 
-        public void AddDescendants(IEnumerable<ProcessSnapshot> descendants)
+        public void AddProcesses(IEnumerable<ProcessSnapshot> processes)
         {
-            foreach (var descendant in descendants)
+            foreach (var process in processes)
             {
-                if (!Descendants.Any(existing =>
-                        existing.ProcessId == descendant.ProcessId &&
-                        existing.StartTime == descendant.StartTime))
+                if (!Processes.Any(existing =>
+                        existing.ProcessId == process.ProcessId &&
+                        existing.StartTime == process.StartTime))
                 {
-                    Descendants.Add(descendant);
+                    Processes.Add(process);
                 }
             }
         }
@@ -773,10 +835,27 @@ public sealed class TestSshd : IDisposable
         char State,
         long StartTime);
 
-    /// <summary>Invokes the POSIX kill system call for a process or process group.</summary>
-    /// <param name="processId">A positive PID or a negative process-group ID.</param>
+    /// <summary>Invokes a Linux system call through libc's variadic syscall entry point.</summary>
+    /// <param name="syscallNumber">The Linux system-call number.</param>
+    /// <param name="processId">The process ID.</param>
+    /// <param name="flags">The pidfd_open flags.</param>
+    /// <returns>The system-call result, or -1 with errno set.</returns>
+    [DllImport("libc", EntryPoint = "syscall", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    private static extern long NativeSyscall(long syscallNumber, int processId, uint flags);
+
+    /// <summary>Invokes pidfd_send_signal through the Linux syscall interface.</summary>
+    /// <param name="syscallNumber">The Linux pidfd_send_signal system-call number.</param>
+    /// <param name="pidfd">The process file descriptor.</param>
     /// <param name="signal">The POSIX signal number.</param>
-    /// <returns>Zero on success; otherwise, -1 and a native error code.</returns>
-    [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
-    private static extern int NativeKill(int processId, int signal);
+    /// <param name="info">Optional signal information; null uses kill-style semantics.</param>
+    /// <param name="flags">The pidfd_send_signal flags.</param>
+    /// <returns>Zero on success; otherwise, -1 with errno set.</returns>
+    [DllImport("libc", EntryPoint = "syscall", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    private static extern long NativeSyscall(long syscallNumber, int pidfd, int signal, IntPtr info, uint flags);
+
+    /// <summary>Closes a Linux file descriptor.</summary>
+    /// <param name="fileDescriptor">The file descriptor to close.</param>
+    /// <returns>Zero on success; otherwise, -1 with errno set.</returns>
+    [DllImport("libc", EntryPoint = "close", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int NativeClose(int fileDescriptor);
 }
