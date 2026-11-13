@@ -25,8 +25,10 @@ public class SftpBrowserSessionUtf8Tests
 
 /// <summary>
 /// The real-system-sshd integration test is gated by SKERRY_TEST_SSH_KEY,
-/// while the standalone TestSshd integration test runs in ordinary dotnet test
-/// and CI without that key.
+/// while the standalone TestSshd integration test needs no key: ordinary
+/// dotnet test attempts it on Linux hosts with sshd and ssh-keygen, such as
+/// CI. It returns without connecting on Windows, or locally when those tools
+/// are unavailable.
 /// </summary>
 public class SftpBrowserSessionTests
 {
