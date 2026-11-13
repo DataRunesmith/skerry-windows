@@ -38,7 +38,7 @@ jobs:
 
   test-core:
     name: Test core library and SSH integration
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
