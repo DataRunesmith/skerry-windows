@@ -50,9 +50,30 @@ public static class FsUtil
         }
     }
 
+    /// <summary>
+    /// Returns the canonical full path and rejects a path whose canonical form leaves the directory
+    /// it names, which is what a <c>..</c> segment does. Paths come from the config file and the
+    /// sync-folder setting, so a traversal segment is never legitimate.
+    /// </summary>
+    private static string ResolveWithoutTraversal(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            var fullDirectory = Path.GetFullPath(directory);
+            if (!fullDirectory.EndsWith(Path.DirectorySeparatorChar))
+                fullDirectory += Path.DirectorySeparatorChar;
+            if (!fullPath.StartsWith(fullDirectory, StringComparison.Ordinal))
+                throw new ArgumentException("The path must not contain traversal segments.", nameof(path));
+        }
+        return fullPath;
+    }
+
     public static byte[] ReadAllBytesCapped(string path, int maxBytes)
     {
         if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        path = ResolveWithoutTraversal(path);
         var attributes = File.GetAttributes(path);
         if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
             throw new IOException("The storage file must be a regular file, not a directory or reparse point.");
