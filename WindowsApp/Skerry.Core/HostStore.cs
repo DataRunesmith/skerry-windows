@@ -17,10 +17,30 @@ public sealed class HostStore
     public static string DefaultPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".skerry", "hosts.json");
 
+    // Set when the file exists but cannot be read (oversized, a directory, a reparse point, no access).
+    // The store then starts empty, so the app still opens, and refuses every change so the file is
+    // never overwritten; an unparseable file still throws from the constructor, as before.
+    private readonly string? _loadError;
+
     public HostStore(string path)
     {
         _path = path;
-        _state = Load(path);
+        try
+        {
+            _state = Load(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            _state = new SyncState();
+            _loadError = e.Message;
+        }
+    }
+
+    private void ThrowIfLoadFailed()
+    {
+        if (_loadError is not null)
+            throw new InvalidOperationException(
+                $"The host database could not be read and was left untouched, so changes are refused: {_loadError}");
     }
 
     /// <summary>
@@ -68,6 +88,7 @@ public sealed class HostStore
     {
         lock (_lock)
         {
+            ThrowIfLoadFailed();
             // Build and size-check the changed state first, so a failure leaves memory and disk unchanged.
             var candidate = CloneState(_state);
             host.ModifiedAt = ReferenceDate.Now();
@@ -83,6 +104,7 @@ public sealed class HostStore
     {
         lock (_lock)
         {
+            ThrowIfLoadFailed();
             var candidate = CloneState(_state);
             candidate.Hosts.RemoveAll(h => h.Id == id);
             candidate.Tombstones[id] = ReferenceDate.Now();
@@ -94,6 +116,7 @@ public sealed class HostStore
     {
         lock (_lock)
         {
+            ThrowIfLoadFailed();
             var remote = provider.Pull() ?? new SyncState();
             Commit(SyncEngine.Merge(_state, remote));
             provider.Push(_state);

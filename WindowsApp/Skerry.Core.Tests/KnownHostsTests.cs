@@ -92,4 +92,26 @@ public sealed class KnownHostsTests
             Directory.Delete(root, recursive: true);
         }
     }
+
+    [Fact]
+    public void AppendStartsOnANewLineWhenTheFileDoesNotEndWithOne()
+    {
+        var root = Directory.CreateTempSubdirectory("skerry-known-hosts-").FullName;
+        try
+        {
+            var path = Path.Combine(root, "known_hosts");
+            File.WriteAllText(path, "old:22 ssh-ed25519 OLDKEY");
+            var store = new KnownHosts(path);
+
+            Assert.Equal(KnownHostVerdict.Learned, store.Check("new", 22, "ssh-ed25519 NEWKEY").Verdict);
+
+            var reloaded = new KnownHosts(path);
+            Assert.Equal(KnownHostVerdict.Trusted, reloaded.Check("old", 22, "ssh-ed25519 OLDKEY").Verdict);
+            Assert.Equal(KnownHostVerdict.Trusted, reloaded.Check("new", 22, "ssh-ed25519 NEWKEY").Verdict);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }

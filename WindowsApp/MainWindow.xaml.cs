@@ -1154,6 +1154,8 @@ public sealed partial class MainWindow : Window
         public string CurrentPath { get; set; } = ".";
         /// <summary>Index of the first entry on the shown page of a large directory (server order).</summary>
         public int PageOffset { get; set; }
+        /// <summary>Incremented per listing request so a slow, superseded listing is ignored.</summary>
+        public int ListingVersion { get; set; }
         public string? PagePath { get; set; }
     }
 
@@ -1248,6 +1250,8 @@ public sealed partial class MainWindow : Window
             state.PageOffset = 0;
         }
         var pageOffset = state.PageOffset;
+        var listedPath = state.CurrentPath;
+        var listingVersion = ++state.ListingVersion;
 
         IReadOnlyList<SftpEntry> entries;
         bool hasMore;
@@ -1255,17 +1259,19 @@ public sealed partial class MainWindow : Window
         {
             (entries, hasMore) = await Task.Run(() =>
             {
-                var result = state.Sftp.List(state.CurrentPath, pageOffset, out var more);
+                var result = state.Sftp.List(listedPath, pageOffset, out var more);
                 return (result, more);
             });
         }
         catch (Exception ex)
         {
+            if (listingVersion != state.ListingVersion) return;
             list.Children.Clear();
             list.Children.Add(StatusText($"Fel: {ex.Message}"));
             return;
         }
 
+        if (listingVersion != state.ListingVersion) return;
         list.Children.Clear();
         if (pageOffset > 0 || hasMore)
         {

@@ -31,7 +31,7 @@ public static class FsUtil
         var dir = Path.GetDirectoryName(path);
         if (string.IsNullOrEmpty(dir))
         {
-            throw new ArgumentException("The path has no parent directory.", nameof(path));
+            dir = "."; // a bare file name lives in the working directory
         }
         var tmpPath = Path.Combine(dir, $".{Path.GetFileName(path)}.tmp.{Guid.NewGuid():N}");
         try
@@ -56,7 +56,7 @@ public static class FsUtil
         var directory = Path.GetDirectoryName(path);
         if (string.IsNullOrEmpty(directory))
         {
-            throw new ArgumentException("The path has no parent directory.", nameof(path));
+            directory = "."; // a bare file name lives in the working directory
         }
         // Same decomposition as AtomicWrite: a directory plus a bare file name.
         path = Path.Combine(directory, Path.GetFileName(path));

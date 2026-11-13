@@ -114,11 +114,30 @@ public sealed class KnownHosts
         if (fileAttributes is not null &&
             (fileAttributes.Value & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
             throw new IOException("known_hosts must be a regular file, not a directory or reparse point.");
-        using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough);
-        var bytes = new System.Text.UTF8Encoding(false).GetBytes($"{id} {keyString}\n");
-        if (stream.Length + bytes.Length > MaxKnownHostsBytes)
+        using var stream = new FileStream(_path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read, 4096, FileOptions.WriteThrough);
+        var originalLength = stream.Length;
+        // A file that does not end in a newline (for example after an interrupted write) must not
+        // swallow the new entry onto its last line.
+        var needsLeadingNewline = false;
+        if (originalLength > 0)
+        {
+            stream.Position = originalLength - 1;
+            needsLeadingNewline = stream.ReadByte() != '\n';
+        }
+        var bytes = new System.Text.UTF8Encoding(false).GetBytes($"{(needsLeadingNewline ? "\n" : "")}{id} {keyString}\n");
+        if (originalLength + bytes.Length > MaxKnownHostsBytes)
             throw new IOException("known_hosts exceeds the size limit of 4 MiB.");
-        stream.Write(bytes, 0, bytes.Length);
-        stream.Flush(flushToDisk: true);
+        try
+        {
+            stream.Position = originalLength;
+            stream.Write(bytes, 0, bytes.Length);
+            stream.Flush(flushToDisk: true);
+        }
+        catch
+        {
+            // Do not leave a partial entry behind.
+            try { stream.SetLength(originalLength); } catch { /* best effort */ }
+            throw;
+        }
     }
 }

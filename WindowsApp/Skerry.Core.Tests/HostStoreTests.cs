@@ -62,6 +62,21 @@ public class HostStoreTests
     }
 
     [Fact]
+    public void OversizedHostsFileDoesNotStopStartupAndIsNeverOverwritten()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        File.WriteAllBytes(path, new byte[FsUtil.MaxStateFileBytes + 1]);
+
+        var store = new HostStore(path);
+
+        Assert.Empty(store.All());
+        Assert.Throws<InvalidOperationException>(() => store.Upsert(Host.Create("x", "192.168.1.56", "user")));
+        Assert.Equal(FsUtil.MaxStateFileBytes + 1, new FileInfo(path).Length);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
     public void HostStoreRoundTripsThroughDisk()
     {
         var dir = TempDir();
