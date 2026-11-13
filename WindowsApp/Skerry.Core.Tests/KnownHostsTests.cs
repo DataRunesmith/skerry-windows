@@ -64,7 +64,7 @@ public sealed class KnownHostsTests
         try
         {
             var path = Path.Combine(root, "known_hosts");
-            File.WriteAllBytes(path, new byte[] { 0xFF, 0xFE, 0x20, 0x41 });
+            File.WriteAllBytes(path, new byte[] { 0x41, 0x20, 0xC3, 0x28 });
             var store = new KnownHosts(path);
             Assert.Equal(KnownHostVerdict.StorageFailure, store.Check("host", 22, "ssh-ed25519 AAAA").Verdict);
         }
@@ -108,6 +108,28 @@ public sealed class KnownHostsTests
             var reloaded = new KnownHosts(path);
             Assert.Equal(KnownHostVerdict.Trusted, reloaded.Check("old", 22, "ssh-ed25519 OLDKEY").Verdict);
             Assert.Equal(KnownHostVerdict.Trusted, reloaded.Check("new", 22, "ssh-ed25519 NEWKEY").Verdict);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RefusesToAppendToAUtf16KnownHostsFile()
+    {
+        var root = Directory.CreateTempSubdirectory("skerry-known-hosts-").FullName;
+        try
+        {
+            var path = Path.Combine(root, "known_hosts");
+            var content = new System.Text.UnicodeEncoding(false, true).GetPreamble()
+                .Concat(System.Text.Encoding.Unicode.GetBytes("old:22 ssh-ed25519 OLDKEY\n")).ToArray();
+            File.WriteAllBytes(path, content);
+            var store = new KnownHosts(path);
+
+            Assert.Equal(KnownHostVerdict.Trusted, store.Check("old", 22, "ssh-ed25519 OLDKEY").Verdict);
+            Assert.Equal(KnownHostVerdict.StorageFailure, store.Check("new", 22, "ssh-ed25519 NEWKEY").Verdict);
+            Assert.Equal(content, File.ReadAllBytes(path));
         }
         finally
         {

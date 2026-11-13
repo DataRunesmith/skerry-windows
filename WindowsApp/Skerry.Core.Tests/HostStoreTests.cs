@@ -105,6 +105,23 @@ public class HostStoreTests
         Directory.Delete(dir, true);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LoadsUtf32EncodedHostsFile(bool bigEndian)
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("utf32-host", "192.168.1.59", "user");
+        new HostStore(path).Upsert(host);
+        var json = File.ReadAllText(path);
+        var encoding = new System.Text.UTF32Encoding(bigEndian, byteOrderMark: true);
+        File.WriteAllBytes(path, encoding.GetPreamble().Concat(encoding.GetBytes(json)).ToArray());
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(dir, true);
+    }
+
     [Fact]
     public void HostStoreRoundTripsThroughDisk()
     {

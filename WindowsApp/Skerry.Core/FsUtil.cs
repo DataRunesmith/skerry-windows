@@ -16,6 +16,12 @@ public static class FsUtil
 
     private static readonly byte[] Utf8Bom = { 0xEF, 0xBB, 0xBF };
 
+    /// <summary>True when <paramref name="head"/> starts with a UTF-16 or UTF-32 byte-order mark, i.e. the file is not UTF-8.</summary>
+    public static bool StartsWithNonUtf8Bom(ReadOnlySpan<byte> head) =>
+        head.StartsWith(new byte[] { 0xFF, 0xFE }) ||
+        head.StartsWith(new byte[] { 0xFE, 0xFF }) ||
+        head.StartsWith(new byte[] { 0x00, 0x00, 0xFE, 0xFF });
+
     /// <summary>
     /// Decodes a text file the way <see cref="File.ReadAllText(string)"/> did: UTF-16 (either byte order)
     /// and UTF-8 with a byte-order mark are recognised, and the mark is not part of the text; anything else is UTF-8.
@@ -23,6 +29,11 @@ public static class FsUtil
     /// </summary>
     public static string DecodeText(byte[] data, bool strict)
     {
+        // UTF-32 marks must be tested before UTF-16: UTF-32 LE starts with the UTF-16 LE mark.
+        if (data.Length >= 4 && data[0] == 0xFF && data[1] == 0xFE && data[2] == 0x00 && data[3] == 0x00)
+            return new System.Text.UTF32Encoding(bigEndian: false, byteOrderMark: false).GetString(data, 4, data.Length - 4);
+        if (data.Length >= 4 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0xFE && data[3] == 0xFF)
+            return new System.Text.UTF32Encoding(bigEndian: true, byteOrderMark: false).GetString(data, 4, data.Length - 4);
         if (data.Length >= 2 && data[0] == 0xFF && data[1] == 0xFE)
             return System.Text.Encoding.Unicode.GetString(data, 2, data.Length - 2);
         if (data.Length >= 2 && data[0] == 0xFE && data[1] == 0xFF)

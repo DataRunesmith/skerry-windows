@@ -121,6 +121,12 @@ public sealed class KnownHosts
         var needsLeadingNewline = false;
         if (originalLength > 0)
         {
+            // The file may be read back as UTF-16/UTF-32, but entries are appended as UTF-8: refuse rather than corrupt it.
+            var head = new byte[(int)Math.Min(4, originalLength)];
+            stream.Position = 0;
+            var headRead = stream.Read(head, 0, head.Length);
+            if (FsUtil.StartsWithNonUtf8Bom(head.AsSpan(0, headRead)))
+                throw new IOException("known_hosts is not UTF-8, so a new entry cannot be appended safely.");
             stream.Position = originalLength - 1;
             needsLeadingNewline = stream.ReadByte() != '\n';
         }
