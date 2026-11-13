@@ -4,7 +4,7 @@ namespace Skerry.Core;
 
 /// <summary>
 /// Port av HostStore.swift — persistent host-databas, `~/.skerry/hosts.json`.
-/// Samma fil kan läsas/skrivas av App/, Android, LinuxApp och WindowsApp.
+/// The same file can be read and written by App/, Android, LinuxApp and WindowsApp.
 /// </summary>
 public sealed class HostStore
 {
@@ -17,32 +17,64 @@ public sealed class HostStore
     public static string DefaultPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".skerry", "hosts.json");
 
+    // Set when the file exists but cannot be read (oversized, a directory, a reparse point, no access).
+    // The store then starts empty, so the app still opens, and refuses every change so the file is
+    // never overwritten; an unparseable file still throws from the constructor, as before.
+    private readonly string? _loadError;
+
     public HostStore(string path)
     {
         _path = path;
-        _state = Load(path);
+        try
+        {
+            _state = Load(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            _state = new SyncState();
+            _loadError = e.Message;
+        }
+    }
+
+    private void ThrowIfLoadFailed()
+    {
+        if (_loadError is not null)
+            throw new InvalidOperationException(
+                $"The host database could not be read and was left untouched, so changes are refused: {_loadError}");
     }
 
     /// <summary>
-    /// Skiljer "filen finns inte än" (tomt tillstånd är korrekt) från
-    /// "filen finns men går inte att tolka i något av de två kända
-    /// formaten" (kasta vidare) — innan denna fix kollapsade båda till ett
-    /// tomt <see cref="SyncState"/>, så nästa <see cref="Upsert"/>/
-    /// <see cref="Delete"/> skrev permanent över en bara TRUNKERAD (inte
-    /// tom) fil med tomt innehåll, en tyst dataförlust utan varning.
+    /// Tells "the file does not exist yet" (an empty state is correct) apart from
+    /// "the file exists but cannot be parsed in either of the two known
+    /// formats" (rethrow). Before this fix both collapsed into an empty
+    /// <see cref="SyncState"/>, so the next <see cref="Upsert"/>/
+    /// <see cref="Delete"/> permanently overwrote a merely TRUNCATED (not
+    /// empty) file with empty content, a silent data loss without warning.
     /// </summary>
     private static SyncState Load(string path)
     {
-        if (!File.Exists(path)) return new SyncState();
-        var text = File.ReadAllText(path);
+        byte[] data;
         try
         {
-            return JsonSerializer.Deserialize<SyncState>(text, JsonOptions) ?? new SyncState();
+            data = FsUtil.ReadAllBytesCapped(path, FsUtil.MaxStateFileBytes);
+        }
+        catch (FileNotFoundException)
+        {
+            return new SyncState();
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return new SyncState();
+        }
+        var json = FsUtil.DecodeText(data, strict: false);
+        try
+        {
+            return JsonSerializer.Deserialize<SyncState>(json, JsonOptions) ?? new SyncState();
         }
         catch (JsonException)
         {
-            // Äldre format: en ren Host[]-array utan SyncState-omslag.
-            return new SyncState { Hosts = JsonSerializer.Deserialize<List<Host>>(text, JsonOptions) ?? new() };
+            // Older format: a plain Host[] array without the SyncState wrapper.
+            return new SyncState { Hosts = JsonSerializer.Deserialize<List<Host>>(json, JsonOptions) ?? new() };
         }
     }
 
@@ -56,12 +88,15 @@ public sealed class HostStore
     {
         lock (_lock)
         {
+            ThrowIfLoadFailed();
+            // Build and size-check the changed state first, so a failure leaves memory and disk unchanged.
+            var candidate = CloneState(_state);
             host.ModifiedAt = ReferenceDate.Now();
-            _state.Tombstones.Remove(host.Id);
-            var index = _state.Hosts.FindIndex(h => h.Id == host.Id);
-            if (index >= 0) _state.Hosts[index] = host;
-            else _state.Hosts.Add(host);
-            Persist();
+            candidate.Tombstones.Remove(host.Id);
+            var index = candidate.Hosts.FindIndex(h => h.Id == host.Id);
+            if (index >= 0) candidate.Hosts[index] = host;
+            else candidate.Hosts.Add(host);
+            Commit(candidate);
         }
     }
 
@@ -69,9 +104,11 @@ public sealed class HostStore
     {
         lock (_lock)
         {
-            _state.Hosts.RemoveAll(h => h.Id == id);
-            _state.Tombstones[id] = ReferenceDate.Now();
-            Persist();
+            ThrowIfLoadFailed();
+            var candidate = CloneState(_state);
+            candidate.Hosts.RemoveAll(h => h.Id == id);
+            candidate.Tombstones[id] = ReferenceDate.Now();
+            Commit(candidate);
         }
     }
 
@@ -79,17 +116,39 @@ public sealed class HostStore
     {
         lock (_lock)
         {
+            ThrowIfLoadFailed();
             var remote = provider.Pull() ?? new SyncState();
-            _state = SyncEngine.Merge(_state, remote);
-            Persist();
+            Commit(SyncEngine.Merge(_state, remote));
             provider.Push(_state);
         }
     }
 
-    private void Persist()
+    /// <summary>Serializes and size-checks <paramref name="candidate"/>, writes it, and only then makes it the current state.</summary>
+    private void Commit(SyncState candidate)
+    {
+        var bytes = Serialize(candidate);
+        Persist(bytes);
+        _state = candidate;
+    }
+
+    private static SyncState CloneState(SyncState state) =>
+        JsonSerializer.Deserialize<SyncState>(JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions), JsonOptions)
+        ?? new SyncState();
+
+    /// <summary>Serializes the state and rejects anything <see cref="Load"/> would refuse to read back.</summary>
+    private static byte[] Serialize(SyncState state)
+    {
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
+        if (bytes.Length > FsUtil.MaxStateFileBytes)
+            throw new InvalidOperationException(
+                $"The host database would exceed the size limit of {FsUtil.MaxStateFileBytes} bytes.");
+        return bytes;
+    }
+
+    private void Persist(byte[] bytes)
     {
         var dir = Path.GetDirectoryName(_path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        FsUtil.AtomicWriteText(_path, JsonSerializer.Serialize(_state, JsonOptions));
+        FsUtil.AtomicWrite(_path, bytes);
     }
 }
