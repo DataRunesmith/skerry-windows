@@ -13,7 +13,7 @@ The .NET 10 SDK. The front end builds on Windows; the core library and its tests
 ## Build and test
 
 ```sh
-dotnet test WindowsApp/Skerry.Core.Tests
+dotnet test WindowsApp/Skerry.Core.Tests/Skerry.Core.Tests.csproj
 ```
 
 <!-- coderabbit-ai-generated:v1 -->
