@@ -27,8 +27,19 @@ public sealed class TestSshd : IDisposable
         ClientKeyPath = clientKeyPath;
     }
 
-    /// <summary>Returnerar null (inte ett kastat undantag) om miljön saknar sshd/ssh-keygen — anroparen hoppar då över testet, samma "hoppa över, inte fail" som Rust-sidans motsvarighet.</summary>
+    /// <summary>Returns null outside CI when sshd or ssh-keygen is missing, so callers skip the test; throws in CI (CI=true) so the SSH tests cannot pass without running.</summary>
     public static TestSshd? Start()
+    {
+        var sshd = StartOptional();
+        if (sshd is null && string.Equals(Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Failed to start the test SSH server in CI.");
+        }
+
+        return sshd;
+    }
+
+    private static TestSshd? StartOptional()
     {
         var dir = Path.Combine(Path.GetTempPath(), $"skerry-cs-sshd-{Guid.NewGuid()}");
         Directory.CreateDirectory(dir);
