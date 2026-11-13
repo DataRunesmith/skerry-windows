@@ -2,24 +2,29 @@
 
 ## Supported Versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+Skerry is under active development and has not had a stable release series yet
+(`WindowsApp/app.manifest` declares version 1.0.0.0). Only the latest code on
+the `main` branch receives security fixes. Older builds are not patched; update
+to the latest build to receive fixes.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+| Version                  | Supported          |
+| ------------------------ | ------------------ |
+| `main` (latest build)    | :white_check_mark: |
+| Any earlier build        | :x:                |
 
 ## Reporting a Vulnerability
 
-<!-- coderabbit-ai-generated:v1 -->
+Report suspected vulnerabilities privately through
+[GitHub private vulnerability reporting](https://github.com/DataRunesmith/skerry-windows/security/advisories/new).
+Do not disclose vulnerability details in a public issue or pull request.
 
-<!-- coderabbit-ai-generated-section:v1:a364d59336dcc526ab166e583e1886e179fab065db750490faaea4bc315e184a -->
+Include the affected version or commit, reproduction steps, and the potential
+impact.
 
-Report suspected vulnerabilities privately using [GitHub private vulnerability reporting](https://github.com/DataRunesmith/skerry-windows/security/advisories/new).
+What to expect:
 
-Include the affected version, reproduction steps, and potential impact. Do not disclose vulnerability details in a public issue.
-
-<!-- /coderabbit-ai-generated:v1 -->
+- We acknowledge a report within 5 business days.
+- We assess it and share an initial verdict within 14 days.
+- Accepted reports are fixed on `main` and published as a security advisory;
+  you are credited unless you ask not to be.
+- If a report is declined, we explain why.
