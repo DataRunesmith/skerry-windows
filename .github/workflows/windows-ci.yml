@@ -27,7 +27,7 @@ jobs:
       - name: Set up .NET 10 LTS
         uses: actions/setup-dotnet@v6.1.0
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 11.0.x
           dotnet-quality: ga
 
       - name: Restore application
@@ -48,7 +48,7 @@ jobs:
       - name: Set up .NET 10 LTS
         uses: actions/setup-dotnet@v6.1.0
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 11.0.x
           dotnet-quality: ga
 
       - name: Install OpenSSH server for integration tests
