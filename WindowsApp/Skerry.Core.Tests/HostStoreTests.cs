@@ -21,6 +21,26 @@ public class HostStoreTests
     }
 
     [Fact]
+    public void OversizedUpdateIsRejectedAndLeavesPreviousStateReadable()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var store = new HostStore(path);
+        var original = Host.Create("small", "192.168.1.52", "user");
+        store.Upsert(original);
+
+        var oversized = Host.Create(new string('a', FsUtil.MaxStateFileBytes + 1), "192.168.1.53", "user");
+        Assert.Throws<InvalidOperationException>(() => store.Upsert(oversized));
+
+        // Neither memory nor disk kept the rejected change, and later saves still work.
+        Assert.Equal(original.Id, Assert.Single(store.All()).Id);
+        Assert.Equal(original.Id, Assert.Single(new HostStore(path).All()).Id);
+        store.Upsert(Host.Create("another", "192.168.1.54", "user"));
+        Assert.Equal(2, new HostStore(path).All().Count);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
     public void HostStoreRoundTripsThroughDisk()
     {
         var dir = TempDir();
