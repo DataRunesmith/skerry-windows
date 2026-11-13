@@ -64,7 +64,7 @@ public sealed class KnownHosts
         {
             return result;
         }
-        var text = new System.Text.UTF8Encoding(false, true).GetString(FsUtil.WithoutUtf8Bom(data));
+        var text = FsUtil.DecodeText(data, strict: true);
         foreach (var line in text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
         {
             var spaceIndex = line.IndexOf(' ');

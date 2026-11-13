@@ -66,7 +66,7 @@ public sealed class HostStore
         {
             return new SyncState();
         }
-        var json = FsUtil.WithoutUtf8Bom(data);
+        var json = FsUtil.DecodeText(data, strict: false);
         try
         {
             return JsonSerializer.Deserialize<SyncState>(json, JsonOptions) ?? new SyncState();

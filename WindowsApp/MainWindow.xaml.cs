@@ -148,7 +148,22 @@ public sealed partial class MainWindow : Window
             ? new HostAuth.KeyFile(keyPathBox.Text.Trim())
             : new HostAuth.AskPassword();
 
-        _store.Upsert(host);
+        try
+        {
+            _store.Upsert(host);
+        }
+        catch (Exception ex)
+        {
+            var errorDialog = new ContentDialog
+            {
+                Title = "Kunde inte spara värd",
+                Content = ex.Message,
+                CloseButtonText = "Stäng",
+                XamlRoot = Content.XamlRoot,
+            };
+            await errorDialog.ShowAsync();
+            return;
+        }
         Refresh();
     }
 

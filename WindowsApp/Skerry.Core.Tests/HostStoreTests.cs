@@ -77,6 +77,21 @@ public class HostStoreTests
     }
 
     [Fact]
+    public void LoadsUtf16EncodedHostsFile()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("utf16-host", "192.168.1.57", "user");
+        new HostStore(path).Upsert(host);
+        var json = File.ReadAllText(path);
+        File.WriteAllBytes(path, new System.Text.UnicodeEncoding(false, true).GetPreamble()
+            .Concat(System.Text.Encoding.Unicode.GetBytes(json)).ToArray());
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
     public void HostStoreRoundTripsThroughDisk()
     {
         var dir = TempDir();

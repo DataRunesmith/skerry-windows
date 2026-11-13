@@ -16,9 +16,22 @@ public static class FsUtil
 
     private static readonly byte[] Utf8Bom = { 0xEF, 0xBB, 0xBF };
 
-    /// <summary>Returns <paramref name="data"/> without a leading UTF-8 byte-order mark, if it has one.</summary>
-    public static ReadOnlySpan<byte> WithoutUtf8Bom(byte[] data) =>
-        data.AsSpan().StartsWith(Utf8Bom) ? data.AsSpan(Utf8Bom.Length) : data.AsSpan();
+    /// <summary>
+    /// Decodes a text file the way <see cref="File.ReadAllText(string)"/> did: UTF-16 (either byte order)
+    /// and UTF-8 with a byte-order mark are recognised, and the mark is not part of the text; anything else is UTF-8.
+    /// With <paramref name="strict"/> invalid UTF-8 throws <see cref="DecoderFallbackException"/> instead of being replaced.
+    /// </summary>
+    public static string DecodeText(byte[] data, bool strict)
+    {
+        if (data.Length >= 2 && data[0] == 0xFF && data[1] == 0xFE)
+            return System.Text.Encoding.Unicode.GetString(data, 2, data.Length - 2);
+        if (data.Length >= 2 && data[0] == 0xFE && data[1] == 0xFF)
+            return System.Text.Encoding.BigEndianUnicode.GetString(data, 2, data.Length - 2);
+        var utf8 = new System.Text.UTF8Encoding(false, strict);
+        return data.AsSpan().StartsWith(Utf8Bom)
+            ? utf8.GetString(data, Utf8Bom.Length, data.Length - Utf8Bom.Length)
+            : utf8.GetString(data);
+    }
 
     /// <summary>
     /// Writes <paramref name="data"/> to <paramref name="path"/> atomically:
