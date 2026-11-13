@@ -92,6 +92,20 @@ public class HostStoreTests
     }
 
     [Fact]
+    public void LoadsLegacyHostArrayWithLeadingUtf8Bom()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("legacy-bom", "192.168.1.58", "user");
+        var legacy = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(
+            new List<Host> { host }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllBytes(path, new byte[] { 0xEF, 0xBB, 0xBF }.Concat(legacy).ToArray());
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
     public void HostStoreRoundTripsThroughDisk()
     {
         var dir = TempDir();
