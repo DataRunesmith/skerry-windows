@@ -648,3 +648,7 @@ bin/
 obj/
 *.user
 .vs/
+
+# Built documentation site
+site/
+.venv-docs/

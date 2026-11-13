@@ -4,7 +4,123 @@ namespace Skerry.Core.Tests;
 
 public class HostStoreTests
 {
-    private static string TempDir() => Path.Combine(Path.GetTempPath(), $"skerry-cs-test-{Guid.NewGuid()}");
+    private static string TempDir() => Directory.CreateTempSubdirectory("skerry-cs-test-").FullName;
+
+    [Fact]
+    public void LoadsHostsFileWithLeadingUtf8Bom()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("bom-host", "192.168.1.51", "user");
+        new HostStore(path).Upsert(host);
+        File.WriteAllBytes(path, new byte[] { 0xEF, 0xBB, 0xBF }.Concat(File.ReadAllBytes(path)).ToArray());
+
+        var reopened = new HostStore(path);
+        Assert.Equal(host.Id, Assert.Single(reopened.All()).Id);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
+    public void OversizedUpdateIsRejectedAndLeavesPreviousStateReadable()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var store = new HostStore(path);
+        var original = Host.Create("small", "192.168.1.52", "user");
+        store.Upsert(original);
+
+        var oversized = Host.Create(new string('a', FsUtil.MaxStateFileBytes + 1), "192.168.1.53", "user");
+        Assert.Throws<InvalidOperationException>(() => store.Upsert(oversized));
+
+        // Neither memory nor disk kept the rejected change, and later saves still work.
+        Assert.Equal(original.Id, Assert.Single(store.All()).Id);
+        Assert.Equal(original.Id, Assert.Single(new HostStore(path).All()).Id);
+        store.Upsert(Host.Create("another", "192.168.1.54", "user"));
+        Assert.Equal(2, new HostStore(path).All().Count);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
+    public void AcceptsDirectoryNamesThatContainTwoDots()
+    {
+        var dir = Path.Combine(TempDir(), "ann..lee");
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("dots", "192.168.1.55", "user");
+        new HostStore(path).Upsert(host);
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(Path.GetDirectoryName(dir)!, true);
+    }
+
+    [Fact]
+    public void RejectsPathsWithATraversalComponent()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "sub", "..", "hosts.json");
+        Assert.Throws<ArgumentException>(() => new HostStore(path));
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
+    public void OversizedHostsFileDoesNotStopStartupAndIsNeverOverwritten()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        File.WriteAllBytes(path, new byte[FsUtil.MaxStateFileBytes + 1]);
+
+        var store = new HostStore(path);
+
+        Assert.Empty(store.All());
+        Assert.Throws<InvalidOperationException>(() => store.Upsert(Host.Create("x", "192.168.1.56", "user")));
+        Assert.Equal(FsUtil.MaxStateFileBytes + 1, new FileInfo(path).Length);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
+    public void LoadsUtf16EncodedHostsFile()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("utf16-host", "192.168.1.57", "user");
+        new HostStore(path).Upsert(host);
+        var json = File.ReadAllText(path);
+        File.WriteAllBytes(path, new System.Text.UnicodeEncoding(false, true).GetPreamble()
+            .Concat(System.Text.Encoding.Unicode.GetBytes(json)).ToArray());
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
+    public void LoadsLegacyHostArrayWithLeadingUtf8Bom()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("legacy-bom", "192.168.1.58", "user");
+        var legacy = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(
+            new List<Host> { host }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllBytes(path, new byte[] { 0xEF, 0xBB, 0xBF }.Concat(legacy).ToArray());
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(dir, true);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LoadsUtf32EncodedHostsFile(bool bigEndian)
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("utf32-host", "192.168.1.59", "user");
+        new HostStore(path).Upsert(host);
+        var json = File.ReadAllText(path);
+        var encoding = new System.Text.UTF32Encoding(bigEndian, byteOrderMark: true);
+        File.WriteAllBytes(path, encoding.GetPreamble().Concat(encoding.GetBytes(json)).ToArray());
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(dir, true);
+    }
 
     [Fact]
     public void HostStoreRoundTripsThroughDisk()
@@ -166,7 +282,7 @@ public class SyncEngineTests
     [Fact]
     public void TwoIndependentStoresConvergeThroughASharedFolderProvider()
     {
-        var dir = Path.Combine(Path.GetTempPath(), $"skerry-cs-sync-test-{Guid.NewGuid()}");
+        var dir = Directory.CreateTempSubdirectory("skerry-cs-sync-test-").FullName;
         var storeAPath = Path.Combine(dir, "a", "hosts.json");
         var storeBPath = Path.Combine(dir, "b", "hosts.json");
         var sharedPath = Path.Combine(dir, "shared", "hosts.json");

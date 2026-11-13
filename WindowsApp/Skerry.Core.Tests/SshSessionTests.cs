@@ -94,9 +94,10 @@ public class SshSessionTests
 }
 
 /// <summary>
-/// Samma tester som ovan, men mot en FRISTÅENDE test-sshd (<see cref="TestSshd"/>)
-/// istället för den nyckel-gatade riktiga systemtjänsten — körbara här och i CI
-/// utan `SKERRY_TEST_SSH_KEY`.
+/// Same tests as above, but against a standalone test sshd (<see cref="TestSshd"/>)
+/// instead of the key-gated real system service. They need no `SKERRY_TEST_SSH_KEY`
+/// and run on Linux hosts with sshd and ssh-keygen, such as CI; they return
+/// without connecting on Windows or where those tools are unavailable.
 /// </summary>
 public class SshSessionStandaloneTests
 {

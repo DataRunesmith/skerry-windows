@@ -5,7 +5,7 @@ namespace Skerry.Core.Tests;
 
 public class SyncCryptoTests
 {
-    private static string TempDir() => Path.Combine(Path.GetTempPath(), $"skerry-cs-enc-test-{Guid.NewGuid()}");
+    private static string TempDir() => Directory.CreateTempSubdirectory("skerry-cs-enc-test-").FullName;
 
     private static string Hex(byte[] bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
 
@@ -34,6 +34,15 @@ public class SyncCryptoTests
         var blob = SyncCrypto.Seal(SampleState(), "correct horse", 1000);
         var opened = SyncCrypto.Open(blob, "correct horse");
         Assert.Equal("web", opened.Hosts[0].Alias);
+    }
+
+    [Theory]
+    [InlineData(999)]
+    [InlineData(10_000_001)]
+    public void SealRejectsOutOfRangeIterationCounts(int iterations)
+    {
+        var ex = Assert.Throws<SyncCryptoException>(() => SyncCrypto.Seal(SampleState(), "pw", iterations));
+        Assert.Equal(SyncCryptoError.BadFormat, ex.Error);
     }
 
     [Fact]

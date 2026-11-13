@@ -1,101 +1,321 @@
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 
 namespace Skerry.Core.Tests;
 
 /// <summary>
-/// Fristående, minimal sshd-instans på en slumpad hög port med en egen
-/// konfigfil (läser INTE `/etc/ssh/sshd_config`) — samma teknik som
-/// LinuxApp/src/port_forward.rs::TestSshd. Träffas alltså inte av
-/// sandlådekontots `DenyUsers`-restriktion i systemtjänstens sshd_config,
-/// som bara gäller den RIKTIGA systemtjänsten på port 22 — se
-/// SftpBrowserSessionTests klassdoc för varför den befintliga,
-/// nyckel-gated integrationstestet aldrig kan köra här.
+/// Standalone, minimal sshd instance on a random high port with its own
+/// configuration file (does not read the system sshd_config). Used by SSH/SFTP integration tests.
 /// </summary>
 public sealed class TestSshd : IDisposable
 {
+    private const int StartupAttempts = 5;
+    private const int SigTerm = 15;
+    private const int SigKill = 9;
+    private const int NoSuchProcess = 3;
+    private const long PidfdSendSignalSyscall = 424;
+    private const long PidfdOpenSyscall = 434;
+
+    private static readonly TimeSpan KeygenTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ProcessStopTimeout = TimeSpan.FromSeconds(2);
+
     private readonly Process _process;
-    private readonly string _dir;
+    private readonly DirectoryInfo _directory;
+    private readonly ProcessGroupState _processGroupState;
+
+    /// <summary>Gets the local TCP port used by the test SSH server.</summary>
     public int Port { get; }
+
+    /// <summary>Gets the path to the private key used by the test SSH client.</summary>
     public string ClientKeyPath { get; }
 
-    private TestSshd(Process process, string dir, int port, string clientKeyPath)
+    /// <summary>Creates a fixture that owns the running SSH server and its temporary files.</summary>
+    /// <param name="process">The running SSH daemon process-group leader.</param>
+    /// <param name="directory">The temporary directory containing the daemon configuration and keys.</param>
+    /// <param name="port">The local TCP port bound by the daemon.</param>
+    /// <param name="clientKeyPath">The private key path used by test clients.</param>
+    private TestSshd(Process process, DirectoryInfo directory, int port, string clientKeyPath, ProcessGroupState processGroupState)
     {
         _process = process;
-        _dir = dir;
+        _directory = directory;
+        _processGroupState = processGroupState;
         Port = port;
         ClientKeyPath = clientKeyPath;
     }
 
-    /// <summary>Returnerar null (inte ett kastat undantag) om miljön saknar sshd/ssh-keygen — anroparen hoppar då över testet, samma "hoppa över, inte fail" som Rust-sidans motsvarighet.</summary>
+    /// <summary>
+    /// Starts the Linux SSH fixture when the required OpenSSH tools are available.
+    /// The daemon runs unprivileged on a high port and authenticates the current user.
+    /// Local environments may skip the fixture when setup is unavailable; CI fails instead.
+    /// </summary>
+    /// <returns>The running SSH fixture, or <see langword="null"/> when it is unavailable locally.</returns>
+    /// <exception cref="InvalidOperationException">The fixture cannot be started in CI.</exception>
     public static TestSshd? Start()
     {
-        var dir = Path.Combine(Path.GetTempPath(), $"skerry-cs-sshd-{Guid.NewGuid()}");
-        Directory.CreateDirectory(dir);
-
-        var hostKey = Path.Combine(dir, "hostkey");
-        if (!RunKeygen(hostKey)) return null;
-        var clientKey = Path.Combine(dir, "client_key");
-        if (!RunKeygen(clientKey)) return null;
-
-        var authorizedKeys = Path.Combine(dir, "authorized_keys");
-        File.Copy(clientKey + ".pub", authorizedKeys);
-
-        int port;
-        using (var probe = new TcpListener(System.Net.IPAddress.Loopback, 0))
+        var fixture = StartOptional();
+        if (fixture is null && string.Equals(
+                Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase))
         {
-            probe.Start();
-            port = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port;
+            throw new InvalidOperationException(
+                "Failed to start the test SSH server in CI. Check openssh-server, openssh-client, util-linux, and Linux pidfd support.");
         }
 
-        var configPath = Path.Combine(dir, "sshd_config");
-        File.WriteAllText(configPath,
-            $"Port {port}\nListenAddress 127.0.0.1\nHostKey {hostKey}\nAuthorizedKeysFile {authorizedKeys}\n" +
-            "PubkeyAuthentication yes\nPasswordAuthentication no\nUsePAM no\nStrictModes no\n" +
-            $"Subsystem sftp internal-sftp\nPidFile {Path.Combine(dir, "pid")}\n");
+        return fixture;
+    }
 
-        var psi = new ProcessStartInfo("/usr/sbin/sshd")
+    /// <summary>Attempts to start the Linux-only SSH fixture without enforcing CI failure semantics.</summary>
+    /// <returns>The running fixture, or <see langword="null"/> when OpenSSH is unavailable or startup fails.</returns>
+    private static TestSshd? StartOptional()
+    {
+        // A non-privileged high port, an explicit host key, and disabled PAM let
+        // OpenSSH run as the test user without granting the test process sudo access.
+        if (!OperatingSystem.IsLinux() ||
+            !File.Exists("/usr/sbin/sshd") ||
+            !File.Exists("/usr/bin/setsid") ||
+            !File.Exists("/usr/bin/ssh-keyscan") ||
+            !SupportsPidFd())
+        {
+            return null;
+        }
+
+        DirectoryInfo? directory;
+        try
+        {
+            directory = Directory.CreateTempSubdirectory("skerry-sshd-");
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+
+        var dir = directory.FullName;
+        Process? server = null;
+        ProcessGroupState? serverState = null;
+
+        try
+        {
+            var hostKey = Path.Combine(dir, "hostkey");
+            if (!RunKeygen(hostKey))
+            {
+                return null;
+            }
+
+            var clientKey = Path.Combine(dir, "client_key");
+            if (!RunKeygen(clientKey))
+            {
+                return null;
+            }
+
+            var authorizedKeys = Path.Combine(dir, "authorized_keys");
+            File.Copy(clientKey + ".pub", authorizedKeys);
+
+            var configPath = Path.Combine(dir, "sshd_config");
+            for (var attempt = 0; attempt < StartupAttempts; attempt++)
+            {
+                var port = FindAvailablePort();
+                File.WriteAllText(configPath,
+                    $"Port {port}\nListenAddress 127.0.0.1\nAuthorizedKeysFile {QuoteConfigPath(authorizedKeys)}\n" +
+                    "PubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\n" +
+                    $"Subsystem sftp internal-sftp\nPidFile {QuoteConfigPath(Path.Combine(dir, "pid"))}\n");
+
+                var psi = new ProcessStartInfo("/usr/bin/setsid")
+                {
+                    UseShellExecute = false,
+                    // Do not redirect daemon output into unread pipes: a full pipe
+                    // could block sshd and make the integration tests hang.
+                };
+                psi.ArgumentList.Add("/usr/sbin/sshd");
+                psi.ArgumentList.Add("-f");
+                psi.ArgumentList.Add(configPath);
+                psi.ArgumentList.Add("-h");
+                psi.ArgumentList.Add(hostKey);
+                psi.ArgumentList.Add("-D");
+                psi.ArgumentList.Add("-e");
+
+                server = Process.Start(psi);
+                if (server is null)
+                {
+                    continue;
+                }
+
+                serverState = new ProcessGroupState(server.Id);
+                if (WaitForServer(server, port, hostKey))
+                {
+                    var processSnapshot = ReadCapturedProcessSnapshot(server.Id);
+                    if (processSnapshot is not null && processSnapshot.Value.ProcessGroupId == server.Id)
+                    {
+                        serverState.StartTime = processSnapshot.Value.StartTime;
+                        var fixture = new TestSshd(server, directory, port, clientKey, serverState);
+                        server = null;       // Ownership transfers to the fixture.
+                        serverState = null;
+                        directory = null;    // The fixture now owns the directory.
+                        return fixture;
+                    }
+                }
+
+                StopProcessGroup(server, serverState);
+                server.Dispose();
+                server = null;
+                serverState = null;
+            }
+
+            return null;
+        }
+        catch (Win32Exception)
+        {
+            // OpenSSH tools may be missing or unavailable on a local host.
+            return null;
+        }
+        finally
+        {
+            var serverStopped = server is null;
+            try
+            {
+                if (server is not null)
+                {
+                    serverState ??= new ProcessGroupState(server.Id);
+                    StopProcessGroup(server, serverState);
+                    serverStopped = true;
+                }
+            }
+            finally
+            {
+                try
+                {
+                    server?.Dispose();
+                }
+                finally
+                {
+                    // Keep the configuration and keys if any daemon process could
+                    // still be alive and using them.
+                    if (directory is not null && serverStopped)
+                    {
+                        TryDeleteDirectory(directory);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Finds an unused loopback TCP port for one SSH daemon startup attempt.</summary>
+    /// <returns>A currently available ephemeral port; the daemon bind is still retried if it races.</returns>
+    private static int FindAvailablePort()
+    {
+        using var probe = new TcpListener(IPAddress.Loopback, 0);
+        probe.Start();
+        return ((IPEndPoint)probe.LocalEndpoint).Port;
+    }
+
+    /// <summary>Waits until the daemon serves the generated host key, not merely any listener on the port.</summary>
+    /// <param name="server">The daemon process.</param>
+    /// <param name="port">The candidate port.</param>
+    /// <param name="hostKeyPath">The private host-key path whose public key must be served.</param>
+    /// <returns><see langword="true"/> only when the expected SSH host key is observed.</returns>
+    private static bool WaitForServer(Process server, int port, string hostKeyPath)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < StartupTimeout)
+        {
+            if (server.HasExited)
+            {
+                return false;
+            }
+
+            if (HasExpectedHostKey(port, hostKeyPath) && !server.HasExited)
+            {
+                return true;
+            }
+
+            Thread.Sleep(100);
+        }
+
+        return false;
+    }
+
+    /// <summary>Scans the candidate port and compares its SSH host key with this fixture's generated key.</summary>
+    /// <param name="port">The candidate port.</param>
+    /// <param name="hostKeyPath">The private host-key path.</param>
+    /// <returns><see langword="true"/> when the listener presents the fixture's Ed25519 key.</returns>
+    private static bool HasExpectedHostKey(int port, string hostKeyPath)
+    {
+        var psi = new ProcessStartInfo("/usr/bin/ssh-keyscan")
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        psi.ArgumentList.Add("-f");
-        psi.ArgumentList.Add(configPath);
-        psi.ArgumentList.Add("-D");
-        psi.ArgumentList.Add("-e");
-        var process = Process.Start(psi);
-        if (process is null)
+        psi.ArgumentList.Add("-4");
+        psi.ArgumentList.Add("-T");
+        psi.ArgumentList.Add("1");
+        psi.ArgumentList.Add("-p");
+        psi.ArgumentList.Add(port.ToString(CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add("-t");
+        psi.ArgumentList.Add("ed25519");
+        psi.ArgumentList.Add("127.0.0.1");
+
+        using var scan = Process.Start(psi);
+        if (scan is null)
         {
-            Directory.Delete(dir, recursive: true);
-            return null;
+            return false;
         }
 
-        for (var i = 0; i < 50; i++)
+        if (!scan.WaitForExit(1500))
         {
-            try
+            StopProcess(scan);
+            return false;
+        }
+
+        var output = scan.StandardOutput.ReadToEnd();
+        _ = scan.StandardError.ReadToEnd();
+        if (scan.ExitCode != 0)
+        {
+            return false;
+        }
+
+        var expected = File.ReadAllText(hostKeyPath + ".pub")
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (expected.Length < 2)
+        {
+            return false;
+        }
+
+        foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var actual = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (actual.Length >= 3 &&
+                string.Equals(actual[1], expected[0], StringComparison.Ordinal) &&
+                string.Equals(actual[2], expected[1], StringComparison.Ordinal))
             {
-                using var probeClient = new TcpClient();
-                probeClient.Connect("127.0.0.1", port);
-                return new TestSshd(process, dir, port, clientKey);
-            }
-            catch (SocketException)
-            {
-                Thread.Sleep(100);
+                return true;
             }
         }
 
-        process.Kill();
-        Directory.Delete(dir, recursive: true);
-        return null;
+        return false;
     }
 
+    /// <summary>Quotes and escapes a filesystem path for use as one OpenSSH configuration argument.</summary>
+    /// <param name="path">The path to encode.</param>
+    /// <returns>The path enclosed in OpenSSH-compatible double quotes.</returns>
+    private static string QuoteConfigPath(string path) =>
+        "\"" + path.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+
+    /// <summary>Generates an unencrypted Ed25519 key pair for the test fixture.</summary>
+    /// <param name="path">The destination path for the private key.</param>
+    /// <returns><see langword="true"/> when key generation succeeds before the timeout; otherwise, <see langword="false"/>.</returns>
+    /// <exception cref="Win32Exception">The key-generation process cannot be started.</exception>
     private static bool RunKeygen(string path)
     {
         var psi = new ProcessStartInfo("ssh-keygen")
         {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
             UseShellExecute = false,
         };
         psi.ArgumentList.Add("-q");
@@ -105,30 +325,545 @@ public sealed class TestSshd : IDisposable
         psi.ArgumentList.Add("ed25519");
         psi.ArgumentList.Add("-f");
         psi.ArgumentList.Add(path);
+
         using var process = Process.Start(psi);
-        if (process is null) return false;
-        process.WaitForExit();
+        if (process is null)
+        {
+            return false;
+        }
+
+        if (!process.WaitForExit((int)KeygenTimeout.TotalMilliseconds))
+        {
+            StopProcess(process);
+            return false;
+        }
+
         return process.ExitCode == 0;
     }
 
-    public void Dispose()
+    /// <summary>Stops a short-lived child process such as ssh-keygen or ssh-keyscan.</summary>
+    /// <param name="process">The child process to stop.</param>
+    /// <exception cref="InvalidOperationException">The process does not exit after termination is requested.</exception>
+    private static void StopProcess(Process process)
+    {
+        if (process.HasExited)
+        {
+            return;
+        }
+
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException) when (process.HasExited)
+        {
+            return;
+        }
+
+        if (!process.WaitForExit(2000))
+        {
+            throw new InvalidOperationException($"Process {process.Id} did not exit after termination was requested.");
+        }
+    }
+
+    /// <summary>Stops the daemon and all captured descendants and process-group members.</summary>
+    /// <param name="process">The daemon process started through <c>setsid</c>; its PID is the process-group ID.</param>
+    /// <exception cref="InvalidOperationException">A captured process remains alive after termination is requested.</exception>
+    /// <exception cref="Win32Exception">A captured process cannot be inspected or signalled.</exception>
+    private static void StopProcessGroup(Process process, ProcessGroupState state)
+    {
+        var processGroupId = state.ProcessGroupId;
+        var root = ReadCapturedProcessSnapshot(processGroupId);
+
+        if (state.StartTime is null)
+        {
+            if (process.HasExited)
+            {
+                return;
+            }
+
+            if (root is null || root.Value.ProcessGroupId != processGroupId)
+            {
+                // setsid has not established an isolated group yet. Never signal
+                // the caller's process group while startup is still in progress.
+                StopProcess(process);
+                return;
+            }
+
+            state.StartTime = root.Value.StartTime;
+        }
+
+        var processGroupStartTime = state.StartTime.Value;
+        var groupIdentityMatches = root is null || root.Value.StartTime == processGroupStartTime;
+        if (groupIdentityMatches)
+        {
+            if (root is not null && root.Value.ProcessGroupId != processGroupId)
+            {
+                throw new InvalidOperationException(
+                    $"SSH daemon process {processGroupId} no longer belongs to its isolated process group.");
+            }
+
+            // Capture the listener, all members of its process group, and its
+            // descendants before signalling. OpenSSH may move connection
+            // children into separate process groups or reparent them.
+            state.AddProcesses(CaptureRelatedProcesses(processGroupId, processGroupId));
+        }
+
+        // Keep identity-bound process handles across retries. A pidfd prevents a
+        // reused numeric PID from receiving a signal intended for an old process.
+        SignalProcesses(state.Processes, SigTerm);
+
+        if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Processes, ProcessStopTimeout))
+        {
+            SignalProcesses(state.Processes, SigKill);
+            if (!WaitForShutdown(process, processGroupId, processGroupStartTime, state.Processes, ProcessStopTimeout))
+            {
+                throw new InvalidOperationException(
+                    $"SSH daemon process group {processGroupId} or one of its captured processes is still running after SIGKILL.");
+            }
+        }
+    }
+
+    /// <summary>Captures the daemon's descendants and process-group members in one /proc snapshot.</summary>
+    /// <param name="rootProcessId">The daemon process ID.</param>
+    /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <returns>All related process identities visible in /proc.</returns>
+    private static List<ProcessSnapshot> CaptureRelatedProcesses(int rootProcessId, int processGroupId)
+    {
+        var processes = new Dictionary<int, ProcessSnapshot>();
+        foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(processDirectory), NumberStyles.None, CultureInfo.InvariantCulture, out var processId))
+            {
+                continue;
+            }
+
+            var snapshot = TryReadProcessSnapshot(processId);
+            if (snapshot is not null)
+            {
+                processes[processId] = snapshot.Value;
+            }
+        }
+
+        var related = new Dictionary<(int ProcessId, long StartTime), ProcessSnapshot>();
+        foreach (var snapshot in processes.Values.Where(snapshot => snapshot.ProcessGroupId == processGroupId))
+        {
+            related[(snapshot.ProcessId, snapshot.StartTime)] = snapshot;
+        }
+
+        var childrenByParent = processes.Values
+            .GroupBy(snapshot => snapshot.ParentProcessId)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+
+        var visited = new HashSet<int> { rootProcessId };
+        var pending = new Stack<int>();
+        pending.Push(rootProcessId);
+
+        while (pending.Count > 0)
+        {
+            var parentProcessId = pending.Pop();
+            if (!childrenByParent.TryGetValue(parentProcessId, out var children))
+            {
+                continue;
+            }
+
+            foreach (var child in children)
+            {
+                if (visited.Add(child.ProcessId))
+                {
+                    related[(child.ProcessId, child.StartTime)] = child;
+                    pending.Push(child.ProcessId);
+                }
+            }
+        }
+
+        return related.Values.ToList();
+    }
+
+    /// <summary>Linux errno for "no such process"; .NET surfaces it as the <see cref="IOException.HResult"/>.</summary>
+    private const int EsrchErrno = 3;
+
+    /// <summary>Reads a process identity, returning null only when the process disappears during inspection.</summary>
+    /// <param name="processId">The process ID.</param>
+    /// <returns>The process identity, or <see langword="null"/> when the process no longer exists.</returns>
+    /// <exception cref="InvalidOperationException">The process stat data is malformed.</exception>
+    private static ProcessSnapshot? ReadProcessSnapshot(int processId)
     {
         try
         {
-            _process.Kill();
-            _process.WaitForExit(2000);
+            var stat = File.ReadAllText($"/proc/{processId}/stat");
+            var closingParenthesis = stat.LastIndexOf(')');
+            if (closingParenthesis < 0)
+            {
+                throw new InvalidOperationException($"Process {processId} has malformed /proc stat data.");
+            }
+
+            var fields = stat[(closingParenthesis + 2)..]
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length <= 19 ||
+                !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var parentProcessId) ||
+                !int.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var processGroupId) ||
+                !long.TryParse(fields[19], NumberStyles.None, CultureInfo.InvariantCulture, out var startTime))
+            {
+                throw new InvalidOperationException($"Process {processId} has malformed /proc stat fields.");
+            }
+
+            return new ProcessSnapshot(processId, parentProcessId, processGroupId, fields[0][0], startTime);
         }
-        catch
+        catch (FileNotFoundException)
         {
-            // best effort — processen kan redan ha dött
+            return null;
         }
-        try
+        catch (DirectoryNotFoundException)
         {
-            Directory.Delete(_dir, recursive: true);
+            return null;
         }
-        catch
+        catch (IOException exception) when (exception.HResult == EsrchErrno)
         {
-            // best effort
+            // The process exited between opening and reading /proc/PID/stat.
+            return null;
         }
     }
+
+    /// <summary>Reads a captured process identity and fails if the process cannot be inspected.</summary>
+    /// <param name="processId">The captured process ID.</param>
+    /// <returns>The process identity, or <see langword="null"/> when the process has exited.</returns>
+    /// <exception cref="InvalidOperationException">The process cannot be inspected reliably.</exception>
+    private static ProcessSnapshot? ReadCapturedProcessSnapshot(int processId)
+    {
+        try
+        {
+            return ReadProcessSnapshot(processId);
+        }
+        catch (IOException exception)
+        {
+            throw new InvalidOperationException($"Unable to inspect captured process {processId}.", exception);
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            throw new InvalidOperationException($"Access denied while inspecting captured process {processId}.", exception);
+        }
+    }
+
+    /// <summary>Best-effort process inspection for unrelated entries discovered while enumerating /proc.</summary>
+    /// <param name="processId">The process ID.</param>
+    /// <returns>The process identity, or <see langword="null"/> when it disappears or cannot be inspected.</returns>
+    private static ProcessSnapshot? TryReadProcessSnapshot(int processId)
+    {
+        try
+        {
+            return ReadProcessSnapshot(processId);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Sends a signal to every captured process using an identity-bound pidfd.</summary>
+    /// <param name="processes">The process snapshots to signal.</param>
+    /// <param name="signal">The POSIX signal number.</param>
+    private static void SignalProcesses(IEnumerable<ProcessSnapshot> processes, int signal)
+    {
+        foreach (var process in processes)
+        {
+            SignalProcess(process, signal);
+        }
+    }
+
+    /// <summary>Sends a signal through a pidfd so PID reuse cannot redirect it to another process.</summary>
+    /// <param name="process">The captured process identity.</param>
+    /// <param name="signal">The POSIX signal number.</param>
+    private static void SignalProcess(ProcessSnapshot process, int signal)
+    {
+        var pidfd = OpenPidFd(process.ProcessId);
+        if (pidfd < 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!IsSameLiveProcess(process))
+            {
+                return;
+            }
+
+            if (NativeSyscall(PidfdSendSignalSyscall, pidfd, signal, IntPtr.Zero, 0u) == 0)
+            {
+                return;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error != NoSuchProcess)
+            {
+                throw new Win32Exception(error, $"Failed to signal SSH fixture process {process.ProcessId}.");
+            }
+        }
+        finally
+        {
+            _ = NativeClose(pidfd);
+        }
+    }
+
+    /// <summary>Opens a pidfd for a process, returning -1 if it has already exited.</summary>
+    /// <param name="processId">The process ID.</param>
+    /// <returns>A pidfd, or -1 when the process no longer exists.</returns>
+    private static int OpenPidFd(int processId)
+    {
+        var result = NativeSyscall(PidfdOpenSyscall, processId, 0u);
+        if (result >= 0)
+        {
+            return checked((int)result);
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error == NoSuchProcess)
+        {
+            return -1;
+        }
+
+        throw new Win32Exception(error, $"Failed to open a pidfd for SSH fixture process {processId}.");
+    }
+
+    /// <summary>Checks that the Linux kernel permits pidfd-based process signalling.</summary>
+    private static bool SupportsPidFd()
+    {
+        int pidfd;
+        try
+        {
+            var result = NativeSyscall(PidfdOpenSyscall, Environment.ProcessId, 0u);
+            if (result < 0)
+            {
+                return false;
+            }
+
+            pidfd = checked((int)result);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+
+        try
+        {
+            return NativeSyscall(PidfdSendSignalSyscall, pidfd, 0, IntPtr.Zero, 0u) == 0;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        finally
+        {
+            _ = NativeClose(pidfd);
+        }
+    }
+
+    /// <summary>Checks whether the captured process still exists with the same start time and is not a zombie.</summary>
+    /// <param name="process">The captured process identity.</param>
+    /// <returns><see langword="true"/> when the same process is still live.</returns>
+    private static bool IsSameLiveProcess(ProcessSnapshot process)
+    {
+        var current = ReadCapturedProcessSnapshot(process.ProcessId);
+        return current is not null &&
+               current.Value.StartTime == process.StartTime &&
+               current.Value.State is not ('Z' or 'X');
+    }
+
+    /// <summary>Checks whether the daemon's isolated process group still has a live member.</summary>
+    /// <param name="processGroupId">The process-group ID.</param>
+    /// <returns><see langword="true"/> when a non-zombie process remains in the group.</returns>
+    private static bool IsProcessGroupRunning(int processGroupId, long processGroupStartTime)
+    {
+        var leader = ReadCapturedProcessSnapshot(processGroupId);
+        if (leader is not null && leader.Value.StartTime != processGroupStartTime)
+        {
+            // The original group has exited and its numeric ID has been reused.
+            return false;
+        }
+
+        foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(processDirectory), NumberStyles.None, CultureInfo.InvariantCulture, out var processId))
+            {
+                continue;
+            }
+
+            var snapshot = TryReadProcessSnapshot(processId);
+            if (snapshot is not null &&
+                snapshot.Value.ProcessGroupId == processGroupId &&
+                snapshot.Value.State is not ('Z' or 'X'))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Waits until the daemon, its process group, and every captured descendant have exited.</summary>
+    /// <param name="process">The daemon process handle.</param>
+    /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <param name="processGroupStartTime">The start time identifying the original process group.</param>
+    /// <param name="descendants">The captured descendant identities.</param>
+    /// <param name="timeout">The maximum wait duration.</param>
+    /// <returns><see langword="true"/> when no live daemon process or captured descendant remains.</returns>
+    private static bool WaitForShutdown(
+        Process process,
+        int processGroupId,
+        long processGroupStartTime,
+        IReadOnlyCollection<ProcessSnapshot> processes,
+        TimeSpan timeout)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < timeout)
+        {
+            if (IsShutdownComplete(process, processGroupId, processGroupStartTime, processes))
+            {
+                return true;
+            }
+
+            Thread.Sleep(50);
+        }
+
+        return IsShutdownComplete(process, processGroupId, processGroupStartTime, processes);
+    }
+
+    /// <summary>Checks all known process identities before allowing fixture files to be deleted.</summary>
+    /// <param name="process">The daemon process handle.</param>
+    /// <param name="processGroupId">The isolated process-group ID.</param>
+    /// <param name="processGroupStartTime">The start time identifying the original process group.</param>
+    /// <param name="descendants">The captured descendant identities.</param>
+    /// <returns><see langword="true"/> when all known daemon processes have exited.</returns>
+    private static bool IsShutdownComplete(
+        Process process,
+        int processGroupId,
+        long processGroupStartTime,
+        IReadOnlyCollection<ProcessSnapshot> processes)
+    {
+        if (!process.HasExited || IsProcessGroupRunning(processGroupId, processGroupStartTime))
+        {
+            return false;
+        }
+
+        return !processes.Any(IsSameLiveProcess);
+    }
+
+    /// <summary>Attempts to remove the fixture's temporary directory without masking an earlier failure.</summary>
+    /// <param name="directory">The temporary directory to delete.</param>
+    private static void TryDeleteDirectory(DirectoryInfo directory)
+    {
+        try
+        {
+            if (directory.Exists)
+            {
+                directory.Delete(recursive: true);
+            }
+        }
+        catch (IOException)
+        {
+            // Best-effort cleanup; do not hide the original fixture failure.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Best-effort cleanup; do not hide the original fixture failure.
+        }
+    }
+
+    /// <summary>Stops the SSH daemon and releases its process handle and temporary files.</summary>
+    public void Dispose()
+    {
+        var stopped = false;
+        try
+        {
+            StopProcessGroup(_process, _processGroupState);
+            stopped = true;
+        }
+        finally
+        {
+            _process.Dispose();
+            if (stopped)
+            {
+                TryDeleteDirectory(_directory);
+            }
+        }
+    }
+
+    /// <summary>Retains the identity and captured descendants of a daemon process group across stop attempts.</summary>
+    private sealed class ProcessGroupState
+    {
+        public ProcessGroupState(int processGroupId) => ProcessGroupId = processGroupId;
+
+        public int ProcessGroupId { get; }
+
+        public long? StartTime { get; set; }
+
+        public List<ProcessSnapshot> Processes { get; } = new();
+
+        public void AddProcesses(IEnumerable<ProcessSnapshot> processes)
+        {
+            foreach (var process in processes)
+            {
+                if (!Processes.Any(existing =>
+                        existing.ProcessId == process.ProcessId &&
+                        existing.StartTime == process.StartTime))
+                {
+                    Processes.Add(process);
+                }
+            }
+        }
+    }
+
+    /// <summary>Identifies a process without relying on a PID that the operating system may reuse.</summary>
+    /// <param name="ProcessId">The process ID.</param>
+    /// <param name="ParentProcessId">The parent process ID.</param>
+    /// <param name="ProcessGroupId">The process-group ID.</param>
+    /// <param name="State">The process state from /proc.</param>
+    /// <param name="StartTime">The process start time from /proc.</param>
+    private readonly record struct ProcessSnapshot(
+        int ProcessId,
+        int ParentProcessId,
+        int ProcessGroupId,
+        char State,
+        long StartTime);
+
+    /// <summary>Invokes a Linux system call through libc's variadic syscall entry point.</summary>
+    /// <param name="syscallNumber">The Linux system-call number.</param>
+    /// <param name="processId">The process ID.</param>
+    /// <param name="flags">The pidfd_open flags.</param>
+    /// <returns>The system-call result, or -1 with errno set.</returns>
+    [DllImport("libc", EntryPoint = "syscall", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    private static extern long NativeSyscall(long syscallNumber, int processId, uint flags);
+
+    /// <summary>Invokes pidfd_send_signal through the Linux syscall interface.</summary>
+    /// <param name="syscallNumber">The Linux pidfd_send_signal system-call number.</param>
+    /// <param name="pidfd">The process file descriptor.</param>
+    /// <param name="signal">The POSIX signal number.</param>
+    /// <param name="info">Optional signal information; null uses kill-style semantics.</param>
+    /// <param name="flags">The pidfd_send_signal flags.</param>
+    /// <returns>Zero on success; otherwise, -1 with errno set.</returns>
+    [DllImport("libc", EntryPoint = "syscall", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    private static extern long NativeSyscall(long syscallNumber, int pidfd, int signal, IntPtr info, uint flags);
+
+    /// <summary>Closes a Linux file descriptor.</summary>
+    /// <param name="fileDescriptor">The file descriptor to close.</param>
+    /// <returns>Zero on success; otherwise, -1 with errno set.</returns>
+    [DllImport("libc", EntryPoint = "close", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int NativeClose(int fileDescriptor);
 }
