@@ -19,10 +19,23 @@ public sealed class KnownHosts
     public static string DefaultPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".skerry", "known_hosts");
 
+    // Set when the file exists but cannot be trusted or read (oversized, a directory, a reparse
+    // point, invalid UTF-8). The store then fails closed: every Check returns StorageFailure and
+    // nothing is appended, so the app still starts and the file is left untouched for repair.
+    private readonly bool _loadFailed;
+
     public KnownHosts(string? path)
     {
         _path = path;
-        _entries = Load(path);
+        try
+        {
+            _entries = Load(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or DecoderFallbackException)
+        {
+            _entries = new Dictionary<string, string>();
+            _loadFailed = true;
+        }
     }
 
     private const int MaxKnownHostsBytes = 4 * 1024 * 1024;
@@ -37,27 +50,21 @@ public sealed class KnownHosts
     {
         var result = new Dictionary<string, string>();
         if (path is null) return result;
-        var attributes = ExistingAttributes(path);
-        if (attributes is null) return result;
-        if ((attributes.Value & FileAttributes.ReparsePoint) != 0)
-            throw new IOException("known_hosts får inte vara en symlänk eller reparse point");
-        if ((attributes.Value & FileAttributes.Directory) != 0)
-            throw new IOException("known_hosts-sökvägen är en katalog");
 
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        if (stream.Length > MaxKnownHostsBytes)
-            throw new IOException("known_hosts överskrider storleksgränsen på 4 MiB");
-        using var memory = new MemoryStream();
-        var buffer = new byte[64 * 1024];
-        while (true)
+        byte[] data;
+        try
         {
-            var count = stream.Read(buffer, 0, buffer.Length);
-            if (count == 0) break;
-            if (memory.Length + count > MaxKnownHostsBytes)
-                throw new IOException("known_hosts överskred storleksgränsen under läsning");
-            memory.Write(buffer, 0, count);
+            data = FsUtil.ReadAllBytesCapped(path, MaxKnownHostsBytes);
         }
-        var text = new System.Text.UTF8Encoding(false, true).GetString(memory.ToArray());
+        catch (FileNotFoundException)
+        {
+            return result;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return result;
+        }
+        var text = new System.Text.UTF8Encoding(false, true).GetString(FsUtil.WithoutUtf8Bom(data));
         foreach (var line in text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
         {
             var spaceIndex = line.IndexOf(' ');
@@ -71,6 +78,7 @@ public sealed class KnownHosts
     {
         lock (_lock)
         {
+            if (_loadFailed) return new KnownHostResult(KnownHostVerdict.StorageFailure);
             var id = $"{host}:{port}";
             if (_entries.TryGetValue(id, out var stored))
                 return stored == keyString
@@ -100,16 +108,16 @@ public sealed class KnownHosts
             var directoryAttributes = ExistingAttributes(dir);
             if (directoryAttributes is null ||
                 (directoryAttributes.Value & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != FileAttributes.Directory)
-                throw new IOException("known_hosts-katalogen måste vara en riktig katalog");
+                throw new IOException("The known_hosts directory must be a real directory.");
         }
         var fileAttributes = ExistingAttributes(_path);
         if (fileAttributes is not null &&
             (fileAttributes.Value & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
-            throw new IOException("known_hosts måste vara en vanlig fil, inte en reparse point");
+            throw new IOException("known_hosts must be a regular file, not a directory or reparse point.");
         using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough);
         var bytes = new System.Text.UTF8Encoding(false).GetBytes($"{id} {keyString}\n");
         if (stream.Length + bytes.Length > MaxKnownHostsBytes)
-            throw new IOException("known_hosts överskrider storleksgränsen på 4 MiB");
+            throw new IOException("known_hosts exceeds the size limit of 4 MiB.");
         stream.Write(bytes, 0, bytes.Length);
         stream.Flush(flushToDisk: true);
     }

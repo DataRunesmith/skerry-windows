@@ -19,7 +19,7 @@ public static class SyncCrypto
     private const int SaltLen = 16;
     private const int NonceLen = 12;
     private const int TagLen = 16;
-    private const int MaxEnvelopeBytes = 64 * 1024 * 1024;
+    private const int MaxEnvelopeBytes = FsUtil.MaxStateFileBytes;
     /// <summary>
     /// Gräns för <c>iterations</c>-fältet LÄST UR EN FIL — kuvertet kommer
     /// per design från en obetrodd tredjepartsmapp, så en manipulerad fil
@@ -129,7 +129,7 @@ public sealed class EncryptedFolderSyncProvider(string path, string passphrase) 
         byte[] data;
         try
         {
-            data = FsUtil.ReadAllBytesCapped(path, 64 * 1024 * 1024);
+            data = FsUtil.ReadAllBytesCapped(path, FsUtil.MaxStateFileBytes);
         }
         catch (FileNotFoundException)
         {

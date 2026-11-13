@@ -5,7 +5,7 @@ namespace Skerry.Core.Tests;
 
 public class SyncCryptoTests
 {
-    private static string TempDir() => Path.Combine(Path.GetTempPath(), $"skerry-cs-enc-test-{Guid.NewGuid()}");
+    private static string TempDir() => Directory.CreateTempSubdirectory("skerry-cs-enc-test-").FullName;
 
     private static string Hex(byte[] bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
 

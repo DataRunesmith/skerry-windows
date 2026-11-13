@@ -4,7 +4,21 @@ namespace Skerry.Core.Tests;
 
 public class HostStoreTests
 {
-    private static string TempDir() => Path.Combine(Path.GetTempPath(), $"skerry-cs-test-{Guid.NewGuid()}");
+    private static string TempDir() => Directory.CreateTempSubdirectory("skerry-cs-test-").FullName;
+
+    [Fact]
+    public void LoadsHostsFileWithLeadingUtf8Bom()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("bom-host", "192.168.1.51", "user");
+        new HostStore(path).Upsert(host);
+        File.WriteAllBytes(path, new byte[] { 0xEF, 0xBB, 0xBF }.Concat(File.ReadAllBytes(path)).ToArray());
+
+        var reopened = new HostStore(path);
+        Assert.Equal(host.Id, Assert.Single(reopened.All()).Id);
+        Directory.Delete(dir, true);
+    }
 
     [Fact]
     public void HostStoreRoundTripsThroughDisk()
@@ -166,7 +180,7 @@ public class SyncEngineTests
     [Fact]
     public void TwoIndependentStoresConvergeThroughASharedFolderProvider()
     {
-        var dir = Path.Combine(Path.GetTempPath(), $"skerry-cs-sync-test-{Guid.NewGuid()}");
+        var dir = Directory.CreateTempSubdirectory("skerry-cs-sync-test-").FullName;
         var storeAPath = Path.Combine(dir, "a", "hosts.json");
         var storeBPath = Path.Combine(dir, "b", "hosts.json");
         var sharedPath = Path.Combine(dir, "shared", "hosts.json");

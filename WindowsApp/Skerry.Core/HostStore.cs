@@ -36,7 +36,7 @@ public sealed class HostStore
         byte[] data;
         try
         {
-            data = FsUtil.ReadAllBytesCapped(path, 64 * 1024 * 1024);
+            data = FsUtil.ReadAllBytesCapped(path, FsUtil.MaxStateFileBytes);
         }
         catch (FileNotFoundException)
         {
@@ -46,14 +46,15 @@ public sealed class HostStore
         {
             return new SyncState();
         }
+        var json = FsUtil.WithoutUtf8Bom(data);
         try
         {
-            return JsonSerializer.Deserialize<SyncState>(data, JsonOptions) ?? new SyncState();
+            return JsonSerializer.Deserialize<SyncState>(json, JsonOptions) ?? new SyncState();
         }
         catch (JsonException)
         {
             // Äldre format: en ren Host[]-array utan SyncState-omslag.
-            return new SyncState { Hosts = JsonSerializer.Deserialize<List<Host>>(data, JsonOptions) ?? new() };
+            return new SyncState { Hosts = JsonSerializer.Deserialize<List<Host>>(json, JsonOptions) ?? new() };
         }
     }
 
@@ -91,16 +92,31 @@ public sealed class HostStore
         lock (_lock)
         {
             var remote = provider.Pull() ?? new SyncState();
-            _state = SyncEngine.Merge(_state, remote);
-            Persist();
+            var merged = SyncEngine.Merge(_state, remote);
+            // Check the size before the merged state replaces the in-memory one or reaches disk.
+            var bytes = Serialize(merged);
+            _state = merged;
+            Persist(bytes);
             provider.Push(_state);
         }
     }
 
-    private void Persist()
+    private void Persist() => Persist(Serialize(_state));
+
+    /// <summary>Serializes the state and rejects anything <see cref="Load"/> would refuse to read back.</summary>
+    private static byte[] Serialize(SyncState state)
+    {
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
+        if (bytes.Length > FsUtil.MaxStateFileBytes)
+            throw new InvalidOperationException(
+                $"The host database would exceed the size limit of {FsUtil.MaxStateFileBytes} bytes.");
+        return bytes;
+    }
+
+    private void Persist(byte[] bytes)
     {
         var dir = Path.GetDirectoryName(_path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        FsUtil.AtomicWriteText(_path, JsonSerializer.Serialize(_state, JsonOptions));
+        FsUtil.AtomicWrite(_path, bytes);
     }
 }

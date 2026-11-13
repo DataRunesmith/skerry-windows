@@ -11,6 +11,15 @@ namespace Skerry.Core;
 /// </summary>
 public static class FsUtil
 {
+    /// <summary>Largest state file (hosts, encrypted sync envelope) the app reads or writes.</summary>
+    public const int MaxStateFileBytes = 64 * 1024 * 1024;
+
+    private static readonly byte[] Utf8Bom = { 0xEF, 0xBB, 0xBF };
+
+    /// <summary>Returns <paramref name="data"/> without a leading UTF-8 byte-order mark, if it has one.</summary>
+    public static ReadOnlySpan<byte> WithoutUtf8Bom(byte[] data) =>
+        data.AsSpan().StartsWith(Utf8Bom) ? data.AsSpan(Utf8Bom.Length) : data.AsSpan();
+
     /// <summary>
     /// Skriver <paramref name="data"/> till <paramref name="path"/> atomärt:
     /// en temporär fil i SAMMA katalog (garanterar att <see cref="File.Move"/>
@@ -22,7 +31,7 @@ public static class FsUtil
         var dir = Path.GetDirectoryName(path);
         if (string.IsNullOrEmpty(dir))
         {
-            throw new ArgumentException("sökvägen saknar en förälderkatalog", nameof(path));
+            throw new ArgumentException("The path has no parent directory.", nameof(path));
         }
         var tmpPath = Path.Combine(dir, $".{Path.GetFileName(path)}.tmp.{Guid.NewGuid():N}");
         try
@@ -46,10 +55,10 @@ public static class FsUtil
         if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
         var attributes = File.GetAttributes(path);
         if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
-            throw new IOException("lagringsfilen måste vara en vanlig fil, inte en reparse point");
+            throw new IOException("The storage file must be a regular file, not a directory or reparse point.");
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         if (stream.Length > maxBytes)
-            throw new IOException($"filen överskrider storleksgränsen på {maxBytes} byte");
+            throw new IOException($"The file exceeds the size limit of {maxBytes} bytes.");
         using var memory = new MemoryStream();
         var buffer = new byte[64 * 1024];
         while (true)
@@ -57,7 +66,7 @@ public static class FsUtil
             var count = stream.Read(buffer, 0, buffer.Length);
             if (count == 0) break;
             if (memory.Length + count > maxBytes)
-                throw new IOException($"filen överskred storleksgränsen på {maxBytes} byte under läsning");
+                throw new IOException($"The file exceeded the size limit of {maxBytes} bytes while being read.");
             memory.Write(buffer, 0, count);
         }
         return memory.ToArray();

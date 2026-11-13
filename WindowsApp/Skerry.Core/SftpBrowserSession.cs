@@ -41,48 +41,72 @@ public sealed class SftpBrowserSession : IDisposable
         }
     }
 
-    /// <summary>Katalogen listas alltid mapp-först, sedan alfabetiskt inom varje grupp (samma sortering som App/LinuxApp).</summary>
-    public IReadOnlyList<SftpEntry> List(string path)
+    /// <summary>
+    /// Lists a directory, folders first, then alphabetically within each group (same sort as App/LinuxApp).
+    /// Enumeration stops after <see cref="MaxDirectoryEntries"/> entries so a huge directory cannot
+    /// exhaust memory; the first entries are still returned, so the directory stays navigable.
+    /// </summary>
+    public IReadOnlyList<SftpEntry> List(string path) => List(path, out _);
+
+    /// <summary>Same as <see cref="List(string)"/>; <paramref name="truncated"/> is true when entries beyond the limit were left out.</summary>
+    public IReadOnlyList<SftpEntry> List(string path, out bool truncated)
     {
-        var entries = _client.ListDirectory(path)
-            .Where(f => f.Name != "." && f.Name != "..")
-            .Take(MaxDirectoryEntries + 1)
-            .Select(f => new SftpEntry(f.Name, f.IsDirectory, f.Length))
-            .ToList();
-        if (entries.Count > MaxDirectoryEntries)
-            throw new IOException($"Katalogen innehåller fler än {MaxDirectoryEntries} poster.");
-        return entries
+        var (entries, limitReached) = ListAsync(path).GetAwaiter().GetResult();
+        truncated = limitReached;
+        return entries;
+    }
+
+    private async Task<(IReadOnlyList<SftpEntry> Entries, bool Truncated)> ListAsync(string path)
+    {
+        var entries = new List<SftpEntry>();
+        var limitReached = false;
+        await foreach (var f in _client.ListDirectoryAsync(path, CancellationToken.None))
+        {
+            if (f.Name == "." || f.Name == "..") continue;
+            if (entries.Count >= MaxDirectoryEntries)
+            {
+                limitReached = true;
+                break;
+            }
+            entries.Add(new SftpEntry(f.Name, f.IsDirectory, f.Length));
+        }
+        IReadOnlyList<SftpEntry> sorted = entries
             .OrderByDescending(e => e.IsDirectory)
             .ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
+        return (sorted, limitReached);
     }
 
     public byte[] ReadFile(string path)
     {
         using var remote = _client.OpenRead(path);
-        if (remote.Length > MaxReadWriteBytes)
-            throw new IOException($"Filen överskrider läsgränsen på {MaxReadWriteBytes} byte.");
-        using var stream = new MemoryStream((int)remote.Length);
+        // The server may not report a size (FSTAT failed or omitted it); then the stream is not
+        // seekable and Length throws, so rely on the streaming limit below.
+        long? knownLength = remote.CanSeek ? remote.Length : null;
+        if (knownLength > MaxReadWriteBytes)
+            throw new IOException($"The file exceeds the read limit of {MaxReadWriteBytes} bytes.");
+        using var stream = knownLength is { } length ? new MemoryStream((int)length) : new MemoryStream();
         var buffer = new byte[64 * 1024];
         while (true)
         {
             var count = remote.Read(buffer, 0, buffer.Length);
             if (count == 0) break;
             if (stream.Length + count > MaxReadWriteBytes)
-                throw new IOException($"Filen överskred läsgränsen på {MaxReadWriteBytes} byte under läsning.");
+                throw new IOException($"The file exceeded the read limit of {MaxReadWriteBytes} bytes while being read.");
             stream.Write(buffer, 0, count);
         }
         return stream.ToArray();
     }
 
-    /// <summary>Skapar eller ersätter en fil, med en övre gräns för att undvika oavsiktliga minnes- och nätverksbelastningar.</summary>
+    /// <summary>Creates or replaces a file, with an upper size limit to avoid accidental memory and network load.</summary>
     public void WriteFile(string path, byte[] data)
     {
         if (data.Length > MaxReadWriteBytes)
-            throw new IOException($"Filen överskrider skrivgränsen på {MaxReadWriteBytes} byte.");
+            throw new IOException($"The file exceeds the write limit of {MaxReadWriteBytes} bytes.");
         using var stream = new MemoryStream(data, writable: false);
         _client.UploadFile(stream, path, canOverride: true);
     }
+
     /// <summary>Försöker avkoda som UTF-8 STRIKT (kastar på ogiltiga byte-sekvenser) — samma säkerhetsmarginal som Swiftsidans <c>String(bytes:encoding:.utf8)</c>: binärt innehåll ska aldrig tyst tolkas som text och riskera att sparas över.</summary>
     public static bool TryDecodeUtf8(byte[] bytes, out string text)
     {

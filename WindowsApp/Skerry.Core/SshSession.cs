@@ -294,7 +294,7 @@ public sealed class SshSession : IDisposable
             if (result.Verdict == KnownHostVerdict.StorageFailure)
             {
                 e.CanTrust = false;
-                throw new IOException("known_hosts kunde inte sparas säkert; SSH-anslutningen avvisades");
+                throw new IOException("known_hosts could not be read or saved safely; the SSH connection was rejected.");
             }
             e.CanTrust = result.Verdict != KnownHostVerdict.Changed;
             if (throwOnChange && result.Verdict == KnownHostVerdict.Changed)
