@@ -480,6 +480,9 @@ public sealed class TestSshd : IDisposable
         return related.Values.ToList();
     }
 
+    /// <summary>Linux errno for "no such process"; .NET surfaces it as the <see cref="IOException.HResult"/>.</summary>
+    private const int EsrchErrno = 3;
+
     /// <summary>Reads a process identity, returning null only when the process disappears during inspection.</summary>
     /// <param name="processId">The process ID.</param>
     /// <returns>The process identity, or <see langword="null"/> when the process no longer exists.</returns>
@@ -513,6 +516,11 @@ public sealed class TestSshd : IDisposable
         }
         catch (DirectoryNotFoundException)
         {
+            return null;
+        }
+        catch (IOException exception) when (exception.HResult == EsrchErrno)
+        {
+            // The process exited between opening and reading /proc/PID/stat.
             return null;
         }
     }
