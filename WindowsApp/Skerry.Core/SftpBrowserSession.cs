@@ -5,12 +5,12 @@ using Renci.SshNet.Sftp;
 namespace Skerry.Core;
 
 /// <summary>
-/// Port av App/SFTPBrowserModel.swifts kärnfunktioner (samma bläddringsmodell
-/// som LinuxApp/src/sftp.rs) — här ovanpå SSH.NETs inbyggda <see cref="SftpClient"/>
-/// istället för en egen SFTP-protokollimplementation (Rust/Swift saknar en
-/// färdig SSH-klient med SFTP inbyggt; SSH.NET har det redan). En anslutning
-/// hålls öppen och återanvänds för hela bläddringen — motsvarar Swiftsidans
-/// <c>ensureClient()</c>-cache / Rusts en-bakgrundstråd-per-flik.
+/// Port of the core features of App/SFTPBrowserModel.swift (same browsing model
+/// as LinuxApp/src/sftp.rs), here on top of SSH.NET's built-in <see cref="SftpClient"/>
+/// instead of a custom SFTP protocol implementation (Rust/Swift lack a
+/// ready-made SSH client with SFTP built in; SSH.NET already has one). One connection
+/// is kept open and reused for the whole browsing session, matching the Swift side's
+/// <c>ensureClient()</c> cache / Rust's one-background-thread-per-tab.
 /// </summary>
 public sealed record SftpEntry(string Name, bool IsDirectory, long Size);
 
@@ -117,7 +117,7 @@ public sealed class SftpBrowserSession : IDisposable
         _client.UploadFile(stream, path, canOverride: true);
     }
 
-    /// <summary>Försöker avkoda som UTF-8 STRIKT (kastar på ogiltiga byte-sekvenser) — samma säkerhetsmarginal som Swiftsidans <c>String(bytes:encoding:.utf8)</c>: binärt innehåll ska aldrig tyst tolkas som text och riskera att sparas över.</summary>
+    /// <summary>Tries to decode as STRICT UTF-8 (throws on invalid byte sequences), the same safety margin as the Swift side's <c>String(bytes:encoding:.utf8)</c>: binary content must never be silently interpreted as text and risk being saved over.</summary>
     public static bool TryDecodeUtf8(byte[] bytes, out string text)
     {
         try
@@ -140,7 +140,7 @@ public sealed class SftpBrowserSession : IDisposable
 
     public void Rename(string from, string to) => _client.RenameFile(from, to);
 
-    /// <summary>mode: oktalt heltal, t.ex. 0b111101101 för "755" — samma notation som chmod.</summary>
+    /// <summary>mode: octal integer, e.g. 0b111101101 for "755", the same notation as chmod.</summary>
     public void SetPermissions(string path, short mode) => _client.ChangePermissions(path, mode);
 
     public void SetOwner(string path, int uid, int gid)

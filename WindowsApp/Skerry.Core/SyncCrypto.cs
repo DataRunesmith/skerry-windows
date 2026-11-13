@@ -5,12 +5,12 @@ using System.Text.Json;
 namespace Skerry.Core;
 
 /// <summary>
-/// Port av Sources/SSHCore/SyncCrypto.swift (samma "BSYNC1"-kuvertformat som
-/// LinuxApp/src/sync_crypto.rs): PBKDF2-HMAC-SHA256 nyckelderivering +
-/// AES-256-GCM. Kuvert: magic(6) || iterations u32 big-endian(4) ||
-/// salt(16) || nonce(12) || ciphertext || tag(16) — identiskt med Apple
-/// CryptoKits AES.GCM.SealedBox.combined-layout, cross-språkverifierat
-/// byte-för-byte mot både Swift och Rust.
+/// Port of Sources/SSHCore/SyncCrypto.swift (same "BSYNC1" envelope format as
+/// LinuxApp/src/sync_crypto.rs): PBKDF2-HMAC-SHA256 key derivation +
+/// AES-256-GCM. Envelope: magic(6) || iterations u32 big-endian(4) ||
+/// salt(16) || nonce(12) || ciphertext || tag(16), identical to Apple
+/// CryptoKit's AES.GCM.SealedBox.combined layout, cross-language verified
+/// byte for byte against both Swift and Rust.
 /// </summary>
 public static class SyncCrypto
 {
@@ -21,11 +21,11 @@ public static class SyncCrypto
     private const int TagLen = 16;
     private const int MaxEnvelopeBytes = FsUtil.MaxStateFileBytes;
     /// <summary>
-    /// Gräns för <c>iterations</c>-fältet LÄST UR EN FIL — kuvertet kommer
-    /// per design från en obetrodd tredjepartsmapp, så en manipulerad fil
-    /// kan annars tvinga fram en godtyckligt dyr PBKDF2-körning INNAN AEAD-
-    /// autentiseringen ens hunnit avvisa den (samma DoS-resonemang/gräns
-    /// som <c>LinuxApp/src/sync_crypto.rs</c>).
+    /// Limit for the <c>iterations</c> field READ FROM A FILE: by design the envelope comes
+    /// from an untrusted third-party folder, so a tampered file could otherwise
+    /// force an arbitrarily expensive PBKDF2 run BEFORE AEAD
+    /// authentication has had a chance to reject it (same DoS reasoning and limit
+    /// as <c>LinuxApp/src/sync_crypto.rs</c>).
     /// </summary>
     private const uint MinIterations = 1_000;
     private const uint MaxIterations = 10_000_000;
@@ -118,9 +118,9 @@ public sealed class SyncCryptoException(SyncCryptoError error) : Exception(error
 }
 
 /// <summary>
-/// Port av EncryptedFolderSyncProvider — rätt för en tredjeparts molnmapp
-/// (Dropbox/Drive/OneDrive) man inte litar på blint. Lösenfrasen sparas
-/// aldrig på disk, bara i minnet under ett synk-anrop.
+/// Port of EncryptedFolderSyncProvider, suited to a third-party cloud folder
+/// (Dropbox/Drive/OneDrive) that is not blindly trusted. The passphrase is
+/// never stored on disk, only in memory during a sync call.
 /// </summary>
 public sealed class EncryptedFolderSyncProvider(string path, string passphrase) : ISyncProvider
 {

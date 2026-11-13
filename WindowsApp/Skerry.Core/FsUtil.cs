@@ -1,13 +1,13 @@
 namespace Skerry.Core;
 
 /// <summary>
-/// Delad hjälpare för atomär filpersistens. Konsoliderat hit för att undvika samma icke-atomära
-/// <c>File.WriteAllText</c>/<c>File.WriteAllBytes</c>-mönster på flera
-/// ställen (HostStore, SyncConfig, SyncCrypto, SyncProvider): ett krasch/
-/// strömavbrott mitt i en direkt skrivning lämnar en trunkerad fil, vilket
-/// <c>Load</c>-sidan annars inte kunde skilja från "filen finns inte än" —
-/// nästa skrivning skulle då permanent skriva över den trunkerade filen
-/// med ett tomt tillstånd.
+/// Shared helper for atomic file persistence. Consolidated here to avoid the same non-atomic
+/// <c>File.WriteAllText</c>/<c>File.WriteAllBytes</c> pattern in several
+/// places (HostStore, SyncConfig, SyncCrypto, SyncProvider): a crash or
+/// power loss in the middle of a direct write leaves a truncated file, which
+/// the <c>Load</c> side could not tell apart from "the file does not exist yet",
+/// so the next write would permanently overwrite the truncated file
+/// with an empty state.
 /// </summary>
 public static class FsUtil
 {
@@ -21,10 +21,10 @@ public static class FsUtil
         data.AsSpan().StartsWith(Utf8Bom) ? data.AsSpan(Utf8Bom.Length) : data.AsSpan();
 
     /// <summary>
-    /// Skriver <paramref name="data"/> till <paramref name="path"/> atomärt:
-    /// en temporär fil i SAMMA katalog (garanterar att <see cref="File.Move"/>
-    /// nedan är en atomär filsystemsoperation, inte en cross-filesystem-
-    /// kopiering) skrivs och flushas, byts sedan in över målet.
+    /// Writes <paramref name="data"/> to <paramref name="path"/> atomically:
+    /// a temporary file in the SAME directory (which guarantees that <see cref="File.Move"/>
+    /// below is an atomic filesystem operation, not a cross-filesystem
+    /// copy) is written and flushed, then swapped in over the target.
     /// </summary>
     public static void AtomicWrite(string path, byte[] data)
     {

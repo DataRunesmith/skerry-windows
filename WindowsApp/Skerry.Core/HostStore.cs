@@ -4,7 +4,7 @@ namespace Skerry.Core;
 
 /// <summary>
 /// Port av HostStore.swift — persistent host-databas, `~/.skerry/hosts.json`.
-/// Samma fil kan läsas/skrivas av App/, Android, LinuxApp och WindowsApp.
+/// The same file can be read and written by App/, Android, LinuxApp and WindowsApp.
 /// </summary>
 public sealed class HostStore
 {
@@ -24,12 +24,12 @@ public sealed class HostStore
     }
 
     /// <summary>
-    /// Skiljer "filen finns inte än" (tomt tillstånd är korrekt) från
-    /// "filen finns men går inte att tolka i något av de två kända
-    /// formaten" (kasta vidare) — innan denna fix kollapsade båda till ett
-    /// tomt <see cref="SyncState"/>, så nästa <see cref="Upsert"/>/
-    /// <see cref="Delete"/> skrev permanent över en bara TRUNKERAD (inte
-    /// tom) fil med tomt innehåll, en tyst dataförlust utan varning.
+    /// Tells "the file does not exist yet" (an empty state is correct) apart from
+    /// "the file exists but cannot be parsed in either of the two known
+    /// formats" (rethrow). Before this fix both collapsed into an empty
+    /// <see cref="SyncState"/>, so the next <see cref="Upsert"/>/
+    /// <see cref="Delete"/> permanently overwrote a merely TRUNCATED (not
+    /// empty) file with empty content, a silent data loss without warning.
     /// </summary>
     private static SyncState Load(string path)
     {
@@ -53,7 +53,7 @@ public sealed class HostStore
         }
         catch (JsonException)
         {
-            // Äldre format: en ren Host[]-array utan SyncState-omslag.
+            // Older format: a plain Host[] array without the SyncState wrapper.
             return new SyncState { Hosts = JsonSerializer.Deserialize<List<Host>>(json, JsonOptions) ?? new() };
         }
     }

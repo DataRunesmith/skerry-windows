@@ -1,9 +1,9 @@
 namespace Skerry.Core;
 
 /// <summary>
-/// Port av Sources/SSHCore/KnownHosts.swift (samma fil/format som
-/// LinuxApp/src/known_hosts.rs): trust-on-first-use-lagring av
-/// värdnycklar, `~/.skerry/known_hosts`, en rad per värd
+/// Port of Sources/SSHCore/KnownHosts.swift (same file/format as
+/// LinuxApp/src/known_hosts.rs): trust-on-first-use storage of
+/// host keys, `~/.skerry/known_hosts`, one line per host
 /// (`host:port ssh-ed25519 AAAA...`).
 /// </summary>
 public enum KnownHostVerdict { Trusted, Learned, Changed, StorageFailure }
