@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v6.1.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Install OpenSSH for the SSH integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+          # Fail here, not later: the SSH tests return without asserting when the fixture tools are missing.
+          test -x /usr/sbin/sshd
+          command -v ssh-keygen
+      - run: dotnet test WindowsApp/Skerry.Core.Tests/Skerry.Core.Tests.csproj
