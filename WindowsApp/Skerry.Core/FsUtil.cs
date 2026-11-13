@@ -60,6 +60,11 @@ public static class FsUtil
         }
         // Same decomposition as AtomicWrite: a directory plus a bare file name.
         path = Path.Combine(directory, Path.GetFileName(path));
+        // These paths come from the config file and the sync-folder setting; a traversal segment is never legitimate.
+        if (path.Contains("..", StringComparison.Ordinal))
+        {
+            throw new ArgumentException("The path must not contain traversal segments.", nameof(path));
+        }
         var attributes = File.GetAttributes(path);
         if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
             throw new IOException("The storage file must be a regular file, not a directory or reparse point.");
