@@ -1239,9 +1239,14 @@ public sealed partial class MainWindow : Window
         list.Children.Add(StatusText("Laddar…"));
 
         IReadOnlyList<SftpEntry> entries;
+        bool truncated;
         try
         {
-            entries = await Task.Run(() => state.Sftp.List(state.CurrentPath));
+            (entries, truncated) = await Task.Run(() =>
+            {
+                var result = state.Sftp.List(state.CurrentPath, out var wasTruncated);
+                return (result, wasTruncated);
+            });
         }
         catch (Exception ex)
         {
@@ -1251,6 +1256,10 @@ public sealed partial class MainWindow : Window
         }
 
         list.Children.Clear();
+        if (truncated)
+        {
+            list.Children.Add(StatusText("Katalogen är för stor: bara de första posterna visas. Öppna en undermapp eller ange en annan sökväg för att nå resten."));
+        }
         foreach (var entry in entries)
         {
             list.Children.Add(BuildFileRow(state, list, pathLabel, entry));
