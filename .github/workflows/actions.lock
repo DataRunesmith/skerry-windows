@@ -9,6 +9,8 @@ workflows:
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/setup-dotnet@v6.1.0'
+    '.github/workflows/security.yml':
+        - 'actions/checkout@v7.0.1'
     '.github/workflows/pages.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/deploy-pages@v5.0.1'
