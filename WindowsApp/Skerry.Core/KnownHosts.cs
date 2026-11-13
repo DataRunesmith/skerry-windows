@@ -31,7 +31,7 @@ public sealed class KnownHosts
         {
             _entries = Load(path);
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or DecoderFallbackException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Text.DecoderFallbackException)
         {
             _entries = new Dictionary<string, string>();
             _loadFailed = true;
