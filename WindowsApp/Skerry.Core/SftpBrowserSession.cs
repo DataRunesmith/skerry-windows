@@ -42,30 +42,40 @@ public sealed class SftpBrowserSession : IDisposable
     }
 
     /// <summary>
-    /// Lists a directory, folders first, then alphabetically within each group (same sort as App/LinuxApp).
-    /// Enumeration stops after <see cref="MaxDirectoryEntries"/> entries so a huge directory cannot
-    /// exhaust memory; the first entries are still returned, so the directory stays navigable.
+    /// Lists the first page of a directory, folders first, then alphabetically within the page (same sort as
+    /// App/LinuxApp). A page holds at most <see cref="MaxDirectoryEntries"/> entries and enumeration stops
+    /// there, so a huge directory cannot exhaust memory; use <see cref="List(string, int, out bool)"/> for the rest.
     /// </summary>
-    public IReadOnlyList<SftpEntry> List(string path) => List(path, out _);
+    public IReadOnlyList<SftpEntry> List(string path) => List(path, 0, out _);
 
-    /// <summary>Same as <see cref="List(string)"/>; <paramref name="truncated"/> is true when entries beyond the limit were left out.</summary>
-    public IReadOnlyList<SftpEntry> List(string path, out bool truncated)
+    /// <summary>
+    /// Lists one page of a directory: the entries after the first <paramref name="skip"/> entries in server
+    /// order, at most <see cref="MaxDirectoryEntries"/> of them. <paramref name="hasMore"/> is true when more
+    /// entries follow the returned page.
+    /// </summary>
+    public IReadOnlyList<SftpEntry> List(string path, int skip, out bool hasMore)
     {
-        var (entries, limitReached) = ListAsync(path).GetAwaiter().GetResult();
-        truncated = limitReached;
+        var (entries, more) = ListAsync(path, skip).GetAwaiter().GetResult();
+        hasMore = more;
         return entries;
     }
 
-    private async Task<(IReadOnlyList<SftpEntry> Entries, bool Truncated)> ListAsync(string path)
+    /// <summary>Number of entries on one directory page.</summary>
+    public static int DirectoryPageSize => MaxDirectoryEntries;
+
+    private async Task<(IReadOnlyList<SftpEntry> Entries, bool HasMore)> ListAsync(string path, int skip)
     {
+        if (skip < 0) throw new ArgumentOutOfRangeException(nameof(skip));
         var entries = new List<SftpEntry>();
-        var limitReached = false;
+        var seen = 0;
+        var hasMore = false;
         await foreach (var f in _client.ListDirectoryAsync(path, CancellationToken.None))
         {
             if (f.Name == "." || f.Name == "..") continue;
+            if (seen++ < skip) continue;
             if (entries.Count >= MaxDirectoryEntries)
             {
-                limitReached = true;
+                hasMore = true;
                 break;
             }
             entries.Add(new SftpEntry(f.Name, f.IsDirectory, f.Length));
@@ -74,7 +84,7 @@ public sealed class SftpBrowserSession : IDisposable
             .OrderByDescending(e => e.IsDirectory)
             .ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
-        return (sorted, limitReached);
+        return (sorted, hasMore);
     }
 
     public byte[] ReadFile(string path)

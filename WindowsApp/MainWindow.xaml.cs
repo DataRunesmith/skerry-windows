@@ -1152,6 +1152,9 @@ public sealed partial class MainWindow : Window
         public required Host Host { get; init; }
         public required string? Password { get; init; }
         public string CurrentPath { get; set; } = ".";
+        /// <summary>Index of the first entry on the shown page of a large directory (server order).</summary>
+        public int PageOffset { get; set; }
+        public string? PagePath { get; set; }
     }
 
     /// <summary>
@@ -1238,14 +1241,22 @@ public sealed partial class MainWindow : Window
         list.Children.Clear();
         list.Children.Add(StatusText("Laddar…"));
 
+        // A new directory always starts on its first page.
+        if (state.PagePath != state.CurrentPath)
+        {
+            state.PagePath = state.CurrentPath;
+            state.PageOffset = 0;
+        }
+        var pageOffset = state.PageOffset;
+
         IReadOnlyList<SftpEntry> entries;
-        bool truncated;
+        bool hasMore;
         try
         {
-            (entries, truncated) = await Task.Run(() =>
+            (entries, hasMore) = await Task.Run(() =>
             {
-                var result = state.Sftp.List(state.CurrentPath, out var wasTruncated);
-                return (result, wasTruncated);
+                var result = state.Sftp.List(state.CurrentPath, pageOffset, out var more);
+                return (result, more);
             });
         }
         catch (Exception ex)
@@ -1256,14 +1267,41 @@ public sealed partial class MainWindow : Window
         }
 
         list.Children.Clear();
-        if (truncated)
+        if (pageOffset > 0 || hasMore)
         {
-            list.Children.Add(StatusText("Katalogen är för stor: bara de första posterna visas. Öppna en undermapp eller ange en annan sökväg för att nå resten."));
+            list.Children.Add(BuildPagingRow(state, list, pathLabel, pageOffset, hasMore));
         }
         foreach (var entry in entries)
         {
             list.Children.Add(BuildFileRow(state, list, pathLabel, entry));
         }
+    }
+
+    /// <summary>Paging controls for a directory with more entries than fit on one page.</summary>
+    private FrameworkElement BuildPagingRow(FilesTabState state, StackPanel list, TextBlock pathLabel, int pageOffset, bool hasMore)
+    {
+        var pageSize = SftpBrowserSession.DirectoryPageSize;
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        row.Children.Add(new TextBlock
+        {
+            Text = $"Stor katalog: visar poster {pageOffset + 1}–{pageOffset + pageSize}{(hasMore ? "" : " (sista sidan)")}.",
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        var previous = new Button { Content = "Föregående sida", IsEnabled = pageOffset > 0 };
+        previous.Click += (_, _) =>
+        {
+            state.PageOffset = Math.Max(0, pageOffset - pageSize);
+            _ = RefreshFilesListAsync(state, list, pathLabel);
+        };
+        var next = new Button { Content = "Nästa sida", IsEnabled = hasMore };
+        next.Click += (_, _) =>
+        {
+            state.PageOffset = pageOffset + pageSize;
+            _ = RefreshFilesListAsync(state, list, pathLabel);
+        };
+        row.Children.Add(previous);
+        row.Children.Add(next);
+        return row;
     }
 
     private FrameworkElement BuildFileRow(FilesTabState state, StackPanel list, TextBlock pathLabel, SftpEntry entry)

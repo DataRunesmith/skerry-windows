@@ -41,6 +41,27 @@ public class HostStoreTests
     }
 
     [Fact]
+    public void AcceptsDirectoryNamesThatContainTwoDots()
+    {
+        var dir = Path.Combine(TempDir(), "ann..lee");
+        var path = Path.Combine(dir, "hosts.json");
+        var host = Host.Create("dots", "192.168.1.55", "user");
+        new HostStore(path).Upsert(host);
+
+        Assert.Equal(host.Id, Assert.Single(new HostStore(path).All()).Id);
+        Directory.Delete(Path.GetDirectoryName(dir)!, true);
+    }
+
+    [Fact]
+    public void RejectsPathsWithATraversalComponent()
+    {
+        var dir = TempDir();
+        var path = Path.Combine(dir, "sub", "..", "hosts.json");
+        Assert.Throws<ArgumentException>(() => new HostStore(path));
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
     public void HostStoreRoundTripsThroughDisk()
     {
         var dir = TempDir();

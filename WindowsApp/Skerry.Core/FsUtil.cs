@@ -60,8 +60,13 @@ public static class FsUtil
         }
         // Same decomposition as AtomicWrite: a directory plus a bare file name.
         path = Path.Combine(directory, Path.GetFileName(path));
-        // These paths come from the config file and the sync-folder setting; a traversal segment is never legitimate.
-        if (path.Contains("..", StringComparison.Ordinal))
+        // These paths come from the config file and the sync-folder setting; a ".." path component
+        // (not a name that merely contains two dots, like "ann..lee") is never legitimate.
+        if (path == ".." ||
+            path.StartsWith("../", StringComparison.Ordinal) || path.StartsWith("..\\", StringComparison.Ordinal) ||
+            path.EndsWith("/..", StringComparison.Ordinal) || path.EndsWith("\\..", StringComparison.Ordinal) ||
+            path.Contains("/../", StringComparison.Ordinal) || path.Contains("/..\\", StringComparison.Ordinal) ||
+            path.Contains("\\../", StringComparison.Ordinal) || path.Contains("\\..\\", StringComparison.Ordinal))
         {
             throw new ArgumentException("The path must not contain traversal segments.", nameof(path));
         }
