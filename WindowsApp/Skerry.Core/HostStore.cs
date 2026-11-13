@@ -68,12 +68,14 @@ public sealed class HostStore
     {
         lock (_lock)
         {
+            // Build and size-check the changed state first, so a failure leaves memory and disk unchanged.
+            var candidate = CloneState(_state);
             host.ModifiedAt = ReferenceDate.Now();
-            _state.Tombstones.Remove(host.Id);
-            var index = _state.Hosts.FindIndex(h => h.Id == host.Id);
-            if (index >= 0) _state.Hosts[index] = host;
-            else _state.Hosts.Add(host);
-            Persist();
+            candidate.Tombstones.Remove(host.Id);
+            var index = candidate.Hosts.FindIndex(h => h.Id == host.Id);
+            if (index >= 0) candidate.Hosts[index] = host;
+            else candidate.Hosts.Add(host);
+            Commit(candidate);
         }
     }
 
@@ -81,9 +83,10 @@ public sealed class HostStore
     {
         lock (_lock)
         {
-            _state.Hosts.RemoveAll(h => h.Id == id);
-            _state.Tombstones[id] = ReferenceDate.Now();
-            Persist();
+            var candidate = CloneState(_state);
+            candidate.Hosts.RemoveAll(h => h.Id == id);
+            candidate.Tombstones[id] = ReferenceDate.Now();
+            Commit(candidate);
         }
     }
 
@@ -92,16 +95,22 @@ public sealed class HostStore
         lock (_lock)
         {
             var remote = provider.Pull() ?? new SyncState();
-            var merged = SyncEngine.Merge(_state, remote);
-            // Check the size before the merged state replaces the in-memory one or reaches disk.
-            var bytes = Serialize(merged);
-            _state = merged;
-            Persist(bytes);
+            Commit(SyncEngine.Merge(_state, remote));
             provider.Push(_state);
         }
     }
 
-    private void Persist() => Persist(Serialize(_state));
+    /// <summary>Serializes and size-checks <paramref name="candidate"/>, writes it, and only then makes it the current state.</summary>
+    private void Commit(SyncState candidate)
+    {
+        var bytes = Serialize(candidate);
+        Persist(bytes);
+        _state = candidate;
+    }
+
+    private static SyncState CloneState(SyncState state) =>
+        JsonSerializer.Deserialize<SyncState>(JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions), JsonOptions)
+        ?? new SyncState();
 
     /// <summary>Serializes the state and rejects anything <see cref="Load"/> would refuse to read back.</summary>
     private static byte[] Serialize(SyncState state)
