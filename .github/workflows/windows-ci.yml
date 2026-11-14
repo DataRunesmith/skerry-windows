@@ -1,0 +1,65 @@
+name: Windows CI
+
+on:
+  pull_request:
+    branches: [main]
+  # Branch pushes also validate this workflow before it is merged.
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows application
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 10 LTS
+        uses: actions/setup-dotnet@v6.1.0
+        with:
+          dotnet-version: 11.0.x
+          dotnet-quality: ga
+
+      - name: Restore application
+        run: dotnet restore WindowsApp/WindowsApp.csproj
+
+      - name: Build application
+        run: dotnet build WindowsApp/WindowsApp.csproj --configuration Release --no-restore -p:Platform=x64
+
+  test-core:
+    name: Test core library and SSH integration
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 10 LTS
+        uses: actions/setup-dotnet@v6.1.0
+        with:
+          dotnet-version: 11.0.x
+          dotnet-quality: ga
+
+      - name: Install OpenSSH server for integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y openssh-server openssh-client util-linux
+          sudo mkdir -p /run/sshd
+          sudo chmod 0755 /run/sshd
+
+      - name: Restore tests
+        run: dotnet restore WindowsApp/Skerry.Core.Tests/Skerry.Core.Tests.csproj
+
+      - name: Run core tests
+        run: dotnet test WindowsApp/Skerry.Core.Tests/Skerry.Core.Tests.csproj --configuration Release --no-restore --logger "console;verbosity=normal"

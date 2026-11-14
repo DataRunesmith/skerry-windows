@@ -148,7 +148,22 @@ public sealed partial class MainWindow : Window
             ? new HostAuth.KeyFile(keyPathBox.Text.Trim())
             : new HostAuth.AskPassword();
 
-        _store.Upsert(host);
+        try
+        {
+            _store.Upsert(host);
+        }
+        catch (Exception ex)
+        {
+            var errorDialog = new ContentDialog
+            {
+                Title = "Kunde inte spara värd",
+                Content = ex.Message,
+                CloseButtonText = "Stäng",
+                XamlRoot = Content.XamlRoot,
+            };
+            await errorDialog.ShowAsync();
+            return;
+        }
         Refresh();
     }
 
@@ -1152,6 +1167,11 @@ public sealed partial class MainWindow : Window
         public required Host Host { get; init; }
         public required string? Password { get; init; }
         public string CurrentPath { get; set; } = ".";
+        /// <summary>Index of the first entry on the shown page of a large directory (server order).</summary>
+        public int PageOffset { get; set; }
+        /// <summary>Incremented per listing request so a slow, superseded listing is ignored.</summary>
+        public int ListingVersion { get; set; }
+        public string? PagePath { get; set; }
     }
 
     /// <summary>
@@ -1238,23 +1258,71 @@ public sealed partial class MainWindow : Window
         list.Children.Clear();
         list.Children.Add(StatusText("Laddar…"));
 
+        // A new directory always starts on its first page.
+        if (state.PagePath != state.CurrentPath)
+        {
+            state.PagePath = state.CurrentPath;
+            state.PageOffset = 0;
+        }
+        var pageOffset = state.PageOffset;
+        var listedPath = state.CurrentPath;
+        var listingVersion = ++state.ListingVersion;
+
         IReadOnlyList<SftpEntry> entries;
+        bool hasMore;
         try
         {
-            entries = await Task.Run(() => state.Sftp.List(state.CurrentPath));
+            (entries, hasMore) = await Task.Run(() =>
+            {
+                var result = state.Sftp.List(listedPath, pageOffset, out var more);
+                return (result, more);
+            });
         }
         catch (Exception ex)
         {
+            if (listingVersion != state.ListingVersion) return;
             list.Children.Clear();
             list.Children.Add(StatusText($"Fel: {ex.Message}"));
             return;
         }
 
+        if (listingVersion != state.ListingVersion) return;
         list.Children.Clear();
+        if (pageOffset > 0 || hasMore)
+        {
+            list.Children.Add(BuildPagingRow(state, list, pathLabel, pageOffset, hasMore));
+        }
         foreach (var entry in entries)
         {
             list.Children.Add(BuildFileRow(state, list, pathLabel, entry));
         }
+    }
+
+    /// <summary>Paging controls for a directory with more entries than fit on one page.</summary>
+    private FrameworkElement BuildPagingRow(FilesTabState state, StackPanel list, TextBlock pathLabel, int pageOffset, bool hasMore)
+    {
+        var pageSize = SftpBrowserSession.DirectoryPageSize;
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        row.Children.Add(new TextBlock
+        {
+            Text = $"Stor katalog: visar poster {pageOffset + 1}–{pageOffset + pageSize}{(hasMore ? "" : " (sista sidan)")}.",
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        var previous = new Button { Content = "Föregående sida", IsEnabled = pageOffset > 0 };
+        previous.Click += (_, _) =>
+        {
+            state.PageOffset = Math.Max(0, pageOffset - pageSize);
+            _ = RefreshFilesListAsync(state, list, pathLabel);
+        };
+        var next = new Button { Content = "Nästa sida", IsEnabled = hasMore };
+        next.Click += (_, _) =>
+        {
+            state.PageOffset = pageOffset + pageSize;
+            _ = RefreshFilesListAsync(state, list, pathLabel);
+        };
+        row.Children.Add(previous);
+        row.Children.Add(next);
+        return row;
     }
 
     private FrameworkElement BuildFileRow(FilesTabState state, StackPanel list, TextBlock pathLabel, SftpEntry entry)

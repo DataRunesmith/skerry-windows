@@ -1,28 +1,61 @@
 namespace Skerry.Core;
 
 /// <summary>
-/// Delad hjälpare för atomär filpersistens. Konsoliderat hit för att undvika samma icke-atomära
-/// <c>File.WriteAllText</c>/<c>File.WriteAllBytes</c>-mönster på flera
-/// ställen (HostStore, SyncConfig, SyncCrypto, SyncProvider): ett krasch/
-/// strömavbrott mitt i en direkt skrivning lämnar en trunkerad fil, vilket
-/// <c>Load</c>-sidan annars inte kunde skilja från "filen finns inte än" —
-/// nästa skrivning skulle då permanent skriva över den trunkerade filen
-/// med ett tomt tillstånd.
+/// Shared helper for atomic file persistence. Consolidated here to avoid the same non-atomic
+/// <c>File.WriteAllText</c>/<c>File.WriteAllBytes</c> pattern in several
+/// places (HostStore, SyncConfig, SyncCrypto, SyncProvider): a crash or
+/// power loss in the middle of a direct write leaves a truncated file, which
+/// the <c>Load</c> side could not tell apart from "the file does not exist yet",
+/// so the next write would permanently overwrite the truncated file
+/// with an empty state.
 /// </summary>
 public static class FsUtil
 {
+    /// <summary>Largest state file (hosts, encrypted sync envelope) the app reads or writes.</summary>
+    public const int MaxStateFileBytes = 64 * 1024 * 1024;
+
+    private static readonly byte[] Utf8Bom = { 0xEF, 0xBB, 0xBF };
+
+    /// <summary>True when <paramref name="head"/> starts with a UTF-16 or UTF-32 byte-order mark, i.e. the file is not UTF-8.</summary>
+    public static bool StartsWithNonUtf8Bom(ReadOnlySpan<byte> head) =>
+        head.StartsWith(new byte[] { 0xFF, 0xFE }) ||
+        head.StartsWith(new byte[] { 0xFE, 0xFF }) ||
+        head.StartsWith(new byte[] { 0x00, 0x00, 0xFE, 0xFF });
+
     /// <summary>
-    /// Skriver <paramref name="data"/> till <paramref name="path"/> atomärt:
-    /// en temporär fil i SAMMA katalog (garanterar att <see cref="File.Move"/>
-    /// nedan är en atomär filsystemsoperation, inte en cross-filesystem-
-    /// kopiering) skrivs och flushas, byts sedan in över målet.
+    /// Decodes a text file the way <see cref="File.ReadAllText(string)"/> did: UTF-16 (either byte order)
+    /// and UTF-8 with a byte-order mark are recognised, and the mark is not part of the text; anything else is UTF-8.
+    /// With <paramref name="strict"/> invalid UTF-8 throws <see cref="DecoderFallbackException"/> instead of being replaced.
+    /// </summary>
+    public static string DecodeText(byte[] data, bool strict)
+    {
+        // UTF-32 marks must be tested before UTF-16: UTF-32 LE starts with the UTF-16 LE mark.
+        if (data.Length >= 4 && data[0] == 0xFF && data[1] == 0xFE && data[2] == 0x00 && data[3] == 0x00)
+            return new System.Text.UTF32Encoding(bigEndian: false, byteOrderMark: false).GetString(data, 4, data.Length - 4);
+        if (data.Length >= 4 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0xFE && data[3] == 0xFF)
+            return new System.Text.UTF32Encoding(bigEndian: true, byteOrderMark: false).GetString(data, 4, data.Length - 4);
+        if (data.Length >= 2 && data[0] == 0xFF && data[1] == 0xFE)
+            return System.Text.Encoding.Unicode.GetString(data, 2, data.Length - 2);
+        if (data.Length >= 2 && data[0] == 0xFE && data[1] == 0xFF)
+            return System.Text.Encoding.BigEndianUnicode.GetString(data, 2, data.Length - 2);
+        var utf8 = new System.Text.UTF8Encoding(false, strict);
+        return data.AsSpan().StartsWith(Utf8Bom)
+            ? utf8.GetString(data, Utf8Bom.Length, data.Length - Utf8Bom.Length)
+            : utf8.GetString(data);
+    }
+
+    /// <summary>
+    /// Writes <paramref name="data"/> to <paramref name="path"/> atomically:
+    /// a temporary file in the SAME directory (which guarantees that <see cref="File.Move"/>
+    /// below is an atomic filesystem operation, not a cross-filesystem
+    /// copy) is written and flushed, then swapped in over the target.
     /// </summary>
     public static void AtomicWrite(string path, byte[] data)
     {
         var dir = Path.GetDirectoryName(path);
         if (string.IsNullOrEmpty(dir))
         {
-            throw new ArgumentException("sökvägen saknar en förälderkatalog", nameof(path));
+            dir = "."; // a bare file name lives in the working directory
         }
         var tmpPath = Path.Combine(dir, $".{Path.GetFileName(path)}.tmp.{Guid.NewGuid():N}");
         try
@@ -39,6 +72,45 @@ public static class FsUtil
             File.Delete(tmpPath);
             throw;
         }
+    }
+
+    public static byte[] ReadAllBytesCapped(string path, int maxBytes)
+    {
+        if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        var directory = Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(directory))
+        {
+            directory = "."; // a bare file name lives in the working directory
+        }
+        // Same decomposition as AtomicWrite: a directory plus a bare file name.
+        path = Path.Combine(directory, Path.GetFileName(path));
+        // These paths come from the config file and the sync-folder setting; a ".." path component
+        // (not a name that merely contains two dots, like "ann..lee") is never legitimate.
+        if (path == ".." ||
+            path.StartsWith("../", StringComparison.Ordinal) || path.StartsWith("..\\", StringComparison.Ordinal) ||
+            path.EndsWith("/..", StringComparison.Ordinal) || path.EndsWith("\\..", StringComparison.Ordinal) ||
+            path.Contains("/../", StringComparison.Ordinal) || path.Contains("/..\\", StringComparison.Ordinal) ||
+            path.Contains("\\../", StringComparison.Ordinal) || path.Contains("\\..\\", StringComparison.Ordinal))
+        {
+            throw new ArgumentException("The path must not contain traversal segments.", nameof(path));
+        }
+        var attributes = File.GetAttributes(path);
+        if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
+            throw new IOException("The storage file must be a regular file, not a directory or reparse point.");
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (stream.Length > maxBytes)
+            throw new IOException($"The file exceeds the size limit of {maxBytes} bytes.");
+        using var memory = new MemoryStream();
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var count = stream.Read(buffer, 0, buffer.Length);
+            if (count == 0) break;
+            if (memory.Length + count > maxBytes)
+                throw new IOException($"The file exceeded the size limit of {maxBytes} bytes while being read.");
+            memory.Write(buffer, 0, count);
+        }
+        return memory.ToArray();
     }
 
     public static void AtomicWriteText(string path, string text) =>
